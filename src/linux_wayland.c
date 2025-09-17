@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "podi.h"
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include "xdg-shell-client-protocol.h"
@@ -6,7 +7,11 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <stdio.h>
 #include <linux/input-event-codes.h>
+#include <locale.h>
+#include <xkbcommon/xkbcommon.h>
+#include <xkbcommon/xkbcommon-compose.h>
 
 typedef struct {
     podi_application_common common;
@@ -20,6 +25,15 @@ typedef struct {
     struct wl_shm *shm;
     uint32_t seat_capabilities;
     uint32_t modifier_state;
+
+    // XKB context for keyboard handling
+    struct xkb_context *xkb_context;
+    struct xkb_keymap *xkb_keymap;
+    struct xkb_state *xkb_state;
+
+    // Compose support for dead keys
+    struct xkb_compose_table *compose_table;
+    struct xkb_compose_state *compose_state;
 } podi_application_wayland;
 
 typedef struct {
@@ -117,10 +131,40 @@ static bool get_pending_event(podi_event *event) {
     return false;
 }
 
-static void keyboard_keymap(void *data __attribute__((unused)), 
+static void keyboard_keymap(void *data,
                            struct wl_keyboard *keyboard __attribute__((unused)),
-                           uint32_t format __attribute__((unused)), 
-                           int fd, uint32_t size __attribute__((unused))) {
+                           uint32_t format, int fd, uint32_t size) {
+    podi_application_wayland *app = (podi_application_wayland *)data;
+
+    if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
+        close(fd);
+        return;
+    }
+
+    char *keymap_string = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (keymap_string == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+
+    // Clean up previous keymap and state
+    if (app->xkb_state) {
+        xkb_state_unref(app->xkb_state);
+        app->xkb_state = NULL;
+    }
+    if (app->xkb_keymap) {
+        xkb_keymap_unref(app->xkb_keymap);
+        app->xkb_keymap = NULL;
+    }
+
+    // Create new keymap and state
+    app->xkb_keymap = xkb_keymap_new_from_string(app->xkb_context, keymap_string,
+                                                XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    if (app->xkb_keymap) {
+        app->xkb_state = xkb_state_new(app->xkb_keymap);
+    }
+
+    munmap(keymap_string, size);
     close(fd);
 }
 
@@ -128,7 +172,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *keyboard __attribute_
                          uint32_t serial __attribute__((unused)), struct wl_surface *surface,
                          struct wl_array *keys __attribute__((unused))) {
     podi_application_wayland *app = (podi_application_wayland *)data;
-    
+
     for (size_t i = 0; i < app->common.window_count; i++) {
         podi_window_wayland *window = (podi_window_wayland *)app->common.windows[i];
         if (window && window->surface == surface) {
@@ -161,9 +205,9 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard __attribute__(
                        uint32_t serial __attribute__((unused)), uint32_t time __attribute__((unused)), uint32_t key,
                        uint32_t state) {
     podi_application_wayland *app = (podi_application_wayland *)data;
-    podi_event_type event_type = (state == WL_KEYBOARD_KEY_STATE_PRESSED) 
+    podi_event_type event_type = (state == WL_KEYBOARD_KEY_STATE_PRESSED)
                                 ? PODI_EVENT_KEY_DOWN : PODI_EVENT_KEY_UP;
-    
+
     podi_event event = {0};
     event.type = event_type;
     event.window = app->common.window_count > 0 ? app->common.windows[0] : NULL;
@@ -171,27 +215,62 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard __attribute__(
     event.key.native_keycode = key;
     event.key.modifiers = app->modifier_state;
     
-    // Basic text input for Wayland (simplified approach)
-    static char text_buffer[32];
+    // XKB-based text input with compose support
+    static char text_buffer[64];
     text_buffer[0] = '\0';
     event.key.text = NULL;
-    
-    if (event_type == PODI_EVENT_KEY_DOWN) {
-        // Simple ASCII mapping for common keys
-        podi_key mapped_key = wayland_keycode_to_podi_key(key);
-        if (mapped_key >= PODI_KEY_A && mapped_key <= PODI_KEY_Z) {
-            text_buffer[0] = 'a' + (mapped_key - PODI_KEY_A);
-            text_buffer[1] = '\0';
-            event.key.text = text_buffer;
-        } else if (mapped_key >= PODI_KEY_0 && mapped_key <= PODI_KEY_9) {
-            text_buffer[0] = '0' + (mapped_key - PODI_KEY_0);
-            text_buffer[1] = '\0';
-            event.key.text = text_buffer;
-        } else if (mapped_key == PODI_KEY_SPACE) {
-            text_buffer[0] = ' ';
-            text_buffer[1] = '\0';
-            event.key.text = text_buffer;
+
+    if (event_type == PODI_EVENT_KEY_DOWN && app->xkb_state) {
+        // Update XKB state with this key press
+        xkb_keycode_t keycode = key + 8; // Wayland keycodes are offset by 8
+        xkb_state_update_key(app->xkb_state, keycode, XKB_KEY_DOWN);
+
+        // Try compose first (for dead key sequences)
+        if (app->compose_state) {
+            xkb_keysym_t keysym = xkb_state_key_get_one_sym(app->xkb_state, keycode);
+            xkb_compose_state_feed(app->compose_state, keysym);
+
+            enum xkb_compose_status status = xkb_compose_state_get_status(app->compose_state);
+            switch (status) {
+                case XKB_COMPOSE_COMPOSING:
+                    // Sequence in progress, don't output text yet
+                    break;
+                case XKB_COMPOSE_COMPOSED: {
+                    // Sequence complete, get composed text
+                    int len = xkb_compose_state_get_utf8(app->compose_state, text_buffer, sizeof(text_buffer));
+                    if (len > 0) {
+                        text_buffer[len] = '\0';
+                        event.key.text = text_buffer;
+                    }
+                    xkb_compose_state_reset(app->compose_state);
+                    break;
+                }
+                case XKB_COMPOSE_CANCELLED:
+                    // Sequence cancelled, reset and fall through to normal processing
+                    xkb_compose_state_reset(app->compose_state);
+                    // fallthrough
+                case XKB_COMPOSE_NOTHING:
+                default:
+                    // No compose sequence, get text from keymap directly
+                    int len = xkb_state_key_get_utf8(app->xkb_state, keycode, text_buffer, sizeof(text_buffer));
+                    if (len > 0) {
+                        text_buffer[len] = '\0';
+                        event.key.text = text_buffer;
+                    }
+                    break;
+            }
+        } else {
+            // No compose support, use direct keymap text
+            int len = xkb_state_key_get_utf8(app->xkb_state, keycode, text_buffer, sizeof(text_buffer));
+            if (len > 0) {
+                text_buffer[len] = '\0';
+                event.key.text = text_buffer;
+            }
         }
+    } else if (event_type == PODI_EVENT_KEY_UP && app->xkb_state) {
+        // Update XKB state for key release
+        xkb_keycode_t keycode = key + 8;
+        xkb_state_update_key(app->xkb_state, keycode, XKB_KEY_UP);
     }
     
     add_pending_event(&event);
@@ -199,10 +278,14 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard __attribute__(
 
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard __attribute__((unused)),
                              uint32_t serial __attribute__((unused)), uint32_t mods_depressed,
-                             uint32_t mods_latched __attribute__((unused)), uint32_t mods_locked __attribute__((unused)),
-                             uint32_t group __attribute__((unused))) {
+                             uint32_t mods_latched, uint32_t mods_locked, uint32_t group) {
     podi_application_wayland *app = (podi_application_wayland *)data;
     app->modifier_state = wayland_mods_to_podi_modifiers(mods_depressed);
+
+    // Update XKB state with modifier information
+    if (app->xkb_state) {
+        xkb_state_update_mask(app->xkb_state, mods_depressed, mods_latched, mods_locked, 0, 0, group);
+    }
 }
 
 static void keyboard_repeat_info(void *data __attribute__((unused)), struct wl_keyboard *keyboard __attribute__((unused)),
@@ -251,23 +334,27 @@ static void pointer_leave(void *data, struct wl_pointer *pointer __attribute__((
     }
 }
 
-static void pointer_motion(void *data __attribute__((unused)), struct wl_pointer *pointer __attribute__((unused)),
+static void pointer_motion(void *data, struct wl_pointer *pointer __attribute__((unused)),
                          uint32_t time __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy) {
+    podi_application_wayland *app = (podi_application_wayland *)data;
     podi_event event = {0};
     event.type = PODI_EVENT_MOUSE_MOVE;
+    event.window = app->common.window_count > 0 ? app->common.windows[0] : NULL;
     event.mouse_move.x = wl_fixed_to_double(sx);
     event.mouse_move.y = wl_fixed_to_double(sy);
     add_pending_event(&event);
 }
 
-static void pointer_button(void *data __attribute__((unused)), struct wl_pointer *pointer __attribute__((unused)),
+static void pointer_button(void *data, struct wl_pointer *pointer __attribute__((unused)),
                          uint32_t serial __attribute__((unused)), uint32_t time __attribute__((unused)), uint32_t button,
                          uint32_t state) {
+    podi_application_wayland *app = (podi_application_wayland *)data;
     podi_event_type event_type = (state == WL_POINTER_BUTTON_STATE_PRESSED)
                                 ? PODI_EVENT_MOUSE_BUTTON_DOWN : PODI_EVENT_MOUSE_BUTTON_UP;
-    
+
     podi_event event = {0};
     event.type = event_type;
+    event.window = app->common.window_count > 0 ? app->common.windows[0] : NULL;
     switch (button) {
         case BTN_LEFT:
             event.mouse_button.button = PODI_MOUSE_BUTTON_LEFT;
@@ -340,12 +427,12 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
                             uint32_t capabilities) {
     podi_application_wayland *app = (podi_application_wayland *)data;
     app->seat_capabilities = capabilities;
-    
+
     if (capabilities & WL_SEAT_CAPABILITY_KEYBOARD) {
         app->keyboard = wl_seat_get_keyboard(seat);
         wl_keyboard_add_listener(app->keyboard, &keyboard_listener, app);
     }
-    
+
     if (capabilities & WL_SEAT_CAPABILITY_POINTER) {
         app->pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(app->pointer, &pointer_listener, app);
@@ -473,7 +560,23 @@ static podi_application *wayland_application_create(void) {
         free(app);
         return NULL;
     }
-    
+
+    // Initialize XKB context
+    app->xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!app->xkb_context) {
+        wl_display_disconnect(app->display);
+        free(app);
+        return NULL;
+    }
+
+    // Initialize compose table from locale
+    setlocale(LC_CTYPE, "");
+    const char *locale = setlocale(LC_CTYPE, NULL);
+    app->compose_table = xkb_compose_table_new_from_locale(app->xkb_context, locale, XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (app->compose_table) {
+        app->compose_state = xkb_compose_state_new(app->compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+    }
+
     return (podi_application *)app;
 }
 
@@ -488,6 +591,13 @@ static void wayland_application_destroy(podi_application *app_generic) {
     }
     free(app->common.windows);
     
+    // Cleanup XKB resources
+    if (app->compose_state) xkb_compose_state_unref(app->compose_state);
+    if (app->compose_table) xkb_compose_table_unref(app->compose_table);
+    if (app->xkb_state) xkb_state_unref(app->xkb_state);
+    if (app->xkb_keymap) xkb_keymap_unref(app->xkb_keymap);
+    if (app->xkb_context) xkb_context_unref(app->xkb_context);
+
     if (app->keyboard) wl_keyboard_destroy(app->keyboard);
     if (app->pointer) wl_pointer_destroy(app->pointer);
     if (app->seat) wl_seat_destroy(app->seat);
@@ -638,6 +748,21 @@ static bool wayland_window_should_close(podi_window *window_generic) {
     return window ? window->common.should_close : true;
 }
 
+static bool wayland_window_get_x11_handles(podi_window *window_generic, podi_x11_handles *handles) {
+    (void)window_generic;
+    (void)handles;
+    return false;
+}
+
+static bool wayland_window_get_wayland_handles(podi_window *window_generic, podi_wayland_handles *handles) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !handles) return false;
+
+    handles->display = window->app->display;
+    handles->surface = window->surface;
+    return true;
+}
+
 const podi_platform_vtable wayland_vtable = {
     .application_create = wayland_application_create,
     .application_destroy = wayland_application_destroy,
@@ -651,5 +776,9 @@ const podi_platform_vtable wayland_vtable = {
     .window_set_size = wayland_window_set_size,
     .window_get_size = wayland_window_get_size,
     .window_should_close = wayland_window_should_close,
+#ifdef PODI_PLATFORM_LINUX
+    .window_get_x11_handles = wayland_window_get_x11_handles,
+    .window_get_wayland_handles = wayland_window_get_wayland_handles,
+#endif
 };
 

@@ -73,6 +73,18 @@ bool podi_window_should_close(podi_window *window) {
     return podi_platform->window_should_close(window);
 }
 
+#ifdef PODI_PLATFORM_LINUX
+bool podi_window_get_x11_handles(podi_window *window, podi_x11_handles *handles) {
+    if (!window || !handles) return false;
+    return podi_platform->window_get_x11_handles(window, handles);
+}
+
+bool podi_window_get_wayland_handles(podi_window *window, podi_wayland_handles *handles) {
+    if (!window || !handles) return false;
+    return podi_platform->window_get_wayland_handles(window, handles);
+}
+#endif
+
 podi_key podi_translate_native_keycode(uint32_t native_keycode) {
     // This will be implemented by platform-specific code via vtable if needed
     // For now, return UNKNOWN as the platform-specific translation should be done

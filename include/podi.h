@@ -111,6 +111,21 @@ void podi_window_set_size(podi_window *window, int width, int height);
 void podi_window_get_size(podi_window *window, int *width, int *height);
 bool podi_window_should_close(podi_window *window);
 
+#ifdef PODI_PLATFORM_LINUX
+typedef struct podi_x11_handles {
+    void *display;
+    unsigned long window;
+} podi_x11_handles;
+
+typedef struct podi_wayland_handles {
+    void *display;
+    void *surface;
+} podi_wayland_handles;
+
+bool podi_window_get_x11_handles(podi_window *window, podi_x11_handles *handles);
+bool podi_window_get_wayland_handles(podi_window *window, podi_wayland_handles *handles);
+#endif
+
 int podi_main(podi_main_func main_func);
 
 #ifdef __cplusplus

@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "podi.h"
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -432,6 +433,21 @@ static bool x11_window_should_close(podi_window *window_generic) {
     return window ? window->common.should_close : true;
 }
 
+static bool x11_window_get_x11_handles(podi_window *window_generic, podi_x11_handles *handles) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window || !handles) return false;
+
+    handles->display = window->app->display;
+    handles->window = window->window;
+    return true;
+}
+
+static bool x11_window_get_wayland_handles(podi_window *window_generic, podi_wayland_handles *handles) {
+    (void)window_generic;
+    (void)handles;
+    return false;
+}
+
 const podi_platform_vtable x11_vtable = {
     .application_create = x11_application_create,
     .application_destroy = x11_application_destroy,
@@ -445,5 +461,9 @@ const podi_platform_vtable x11_vtable = {
     .window_set_size = x11_window_set_size,
     .window_get_size = x11_window_get_size,
     .window_should_close = x11_window_should_close,
+#ifdef PODI_PLATFORM_LINUX
+    .window_get_x11_handles = x11_window_get_x11_handles,
+    .window_get_wayland_handles = x11_window_get_wayland_handles,
+#endif
 };
 
