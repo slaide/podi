@@ -1,0 +1,5 @@
+obj
+lib
+examples/demo
+src/xdg-shell-client-protocol.h
+src/xdg-shell-protocol.c
