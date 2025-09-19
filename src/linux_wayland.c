@@ -2,7 +2,9 @@
 #include "podi.h"
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
+#include <wayland-cursor.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -22,6 +24,7 @@ typedef struct {
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
     struct xdg_wm_base *xdg_wm_base;
+    struct zxdg_decoration_manager_v1 *decoration_manager;
     struct wl_shm *shm;
     uint32_t seat_capabilities;
     uint32_t modifier_state;
@@ -34,6 +37,18 @@ typedef struct {
     // Compose support for dead keys
     struct xkb_compose_table *compose_table;
     struct xkb_compose_state *compose_state;
+
+    // Output scale tracking
+    struct wl_output **outputs;
+    int32_t *output_scales;
+    size_t output_count;
+    size_t output_capacity;
+    int32_t max_scale;
+    uint32_t last_input_serial;
+
+    // Cursor theme support
+    struct wl_cursor_theme *cursor_theme;
+    struct wl_surface *cursor_surface;
 } podi_application_wayland;
 
 typedef struct {
@@ -42,7 +57,9 @@ typedef struct {
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *xdg_toplevel;
+    struct zxdg_toplevel_decoration_v1 *decoration;
     bool configured;
+    uint32_t last_input_serial;
 } podi_window_wayland;
 
 static uint32_t wayland_mods_to_podi_modifiers(uint32_t mods_depressed) {
@@ -202,9 +219,10 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard __attribute_
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *keyboard __attribute__((unused)),
-                       uint32_t serial __attribute__((unused)), uint32_t time __attribute__((unused)), uint32_t key,
+                       uint32_t serial, uint32_t time __attribute__((unused)), uint32_t key,
                        uint32_t state) {
     podi_application_wayland *app = (podi_application_wayland *)data;
+    app->last_input_serial = serial;
     podi_event_type event_type = (state == WL_KEYBOARD_KEY_STATE_PRESSED)
                                 ? PODI_EVENT_KEY_DOWN : PODI_EVENT_KEY_UP;
 
@@ -346,9 +364,10 @@ static void pointer_motion(void *data, struct wl_pointer *pointer __attribute__(
 }
 
 static void pointer_button(void *data, struct wl_pointer *pointer __attribute__((unused)),
-                         uint32_t serial __attribute__((unused)), uint32_t time __attribute__((unused)), uint32_t button,
+                         uint32_t serial, uint32_t time __attribute__((unused)), uint32_t button,
                          uint32_t state) {
     podi_application_wayland *app = (podi_application_wayland *)data;
+    app->last_input_serial = serial;
     podi_event_type event_type = (state == WL_POINTER_BUTTON_STATE_PRESSED)
                                 ? PODI_EVENT_MOUSE_BUTTON_DOWN : PODI_EVENT_MOUSE_BUTTON_UP;
 
@@ -442,6 +461,64 @@ static void seat_capabilities(void *data, struct wl_seat *seat,
 static void seat_name(void *data __attribute__((unused)), struct wl_seat *seat __attribute__((unused)), const char *name __attribute__((unused))) {
 }
 
+// Output listener for scale detection
+static void output_geometry(void *data __attribute__((unused)), struct wl_output *wl_output __attribute__((unused)),
+                           int32_t x __attribute__((unused)), int32_t y __attribute__((unused)),
+                           int32_t physical_width __attribute__((unused)), int32_t physical_height __attribute__((unused)),
+                           int32_t subpixel __attribute__((unused)), const char *make __attribute__((unused)),
+                           const char *model __attribute__((unused)), int32_t transform __attribute__((unused))) {
+    // We don't need geometry info for scale detection
+}
+
+static void output_mode(void *data __attribute__((unused)), struct wl_output *wl_output __attribute__((unused)),
+                       uint32_t flags __attribute__((unused)), int32_t width __attribute__((unused)),
+                       int32_t height __attribute__((unused)), int32_t refresh __attribute__((unused))) {
+    // We don't need mode info for scale detection
+}
+
+static void output_done(void *data __attribute__((unused)), struct wl_output *wl_output __attribute__((unused))) {
+    // Scale changes are applied immediately in output_scale
+}
+
+static void output_scale(void *data, struct wl_output *wl_output, int32_t factor) {
+    podi_application_wayland *app = (podi_application_wayland *)data;
+
+    // Find this output in our list and update its scale
+    for (size_t i = 0; i < app->output_count; i++) {
+        if (app->outputs[i] == wl_output) {
+            app->output_scales[i] = factor;
+
+            // Update max scale
+            app->max_scale = 1;
+            for (size_t j = 0; j < app->output_count; j++) {
+                if (app->output_scales[j] > app->max_scale) {
+                    app->max_scale = app->output_scales[j];
+                }
+            }
+            return;
+        }
+    }
+}
+
+static void output_name(void *data __attribute__((unused)), struct wl_output *wl_output __attribute__((unused)),
+                       const char *name __attribute__((unused))) {
+    // We don't need output name for scale detection
+}
+
+static void output_description(void *data __attribute__((unused)), struct wl_output *wl_output __attribute__((unused)),
+                              const char *description __attribute__((unused))) {
+    // We don't need output description for scale detection
+}
+
+static const struct wl_output_listener output_listener = {
+    output_geometry,
+    output_mode,
+    output_done,
+    output_scale,
+    output_name,
+    output_description,
+};
+
 static const struct wl_seat_listener seat_listener = {
     seat_capabilities,
     seat_name,
@@ -462,18 +539,30 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
                                  int32_t width, int32_t height,
                                  struct wl_array *states __attribute__((unused))) {
     podi_window_wayland *window = (podi_window_wayland *)data;
-    
-    if (width > 0 && height > 0 && 
-        (width != window->common.width || height != window->common.height)) {
-        window->common.width = width;
-        window->common.height = height;
-        
-        podi_event event = {0};
-        event.type = PODI_EVENT_WINDOW_RESIZE;
-        event.window = (podi_window *)window;
-        event.window_resize.width = width;
-        event.window_resize.height = height;
-        add_pending_event(&event);
+
+    // Convert logical size from Wayland to physical size for consistency with X11
+    if (width > 0 && height > 0) {
+        int physical_width = (int)(width * window->common.scale_factor);
+        int physical_height = (int)(height * window->common.scale_factor);
+
+        // Ensure dimensions are divisible by scale factor to satisfy Wayland protocol
+        int scale = (int)window->common.scale_factor;
+        if (scale > 1) {
+            physical_width = (physical_width / scale) * scale;
+            physical_height = (physical_height / scale) * scale;
+        }
+
+        if (physical_width != window->common.width || physical_height != window->common.height) {
+            window->common.width = physical_width;
+            window->common.height = physical_height;
+
+            podi_event event = {0};
+            event.type = PODI_EVENT_WINDOW_RESIZE;
+            event.window = (podi_window *)window;
+            event.window_resize.width = physical_width;
+            event.window_resize.height = physical_height;
+            add_pending_event(&event);
+        }
     }
 }
 
@@ -513,10 +602,21 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     xdg_wm_base_ping,
 };
 
+static void decoration_configure(void *data __attribute__((unused)),
+                               struct zxdg_toplevel_decoration_v1 *decoration __attribute__((unused)),
+                               uint32_t mode __attribute__((unused))) {
+    // The compositor has set the decoration mode
+    // We don't need to do anything here as we just want server-side decorations
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
+    decoration_configure,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                           uint32_t name, const char *interface, uint32_t version __attribute__((unused))) {
     podi_application_wayland *app = (podi_application_wayland *)data;
-    
+
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         app->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
@@ -525,8 +625,29 @@ static void registry_global(void *data, struct wl_registry *registry,
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         app->xdg_wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(app->xdg_wm_base, &xdg_wm_base_listener, app);
+    } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
+        app->decoration_manager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        // Add output to our tracking list
+        if (app->output_count >= app->output_capacity) {
+            size_t new_capacity = app->output_capacity ? app->output_capacity * 2 : 4;
+            struct wl_output **new_outputs = realloc(app->outputs, new_capacity * sizeof(struct wl_output *));
+            int32_t *new_scales = realloc(app->output_scales, new_capacity * sizeof(int32_t));
+            if (new_outputs && new_scales) {
+                app->outputs = new_outputs;
+                app->output_scales = new_scales;
+                app->output_capacity = new_capacity;
+            }
+        }
+
+        if (app->output_count < app->output_capacity) {
+            app->outputs[app->output_count] = wl_registry_bind(registry, name, &wl_output_interface, 2);
+            app->output_scales[app->output_count] = 1; // Default scale
+            wl_output_add_listener(app->outputs[app->output_count], &output_listener, app);
+            app->output_count++;
+        }
     }
 }
 
@@ -539,9 +660,18 @@ static const struct wl_registry_listener registry_listener = {
     registry_global_remove,
 };
 
+static float wayland_get_display_scale_factor(podi_application *app_generic) {
+    podi_application_wayland *app = (podi_application_wayland *)app_generic;
+    if (!app) return 1.0f;
+    return (float)app->max_scale;
+}
+
 static podi_application *wayland_application_create(void) {
     podi_application_wayland *app = calloc(1, sizeof(podi_application_wayland));
     if (!app) return NULL;
+
+    // Initialize output tracking
+    app->max_scale = 1;
     
     app->display = wl_display_connect(NULL);
     if (!app->display) {
@@ -554,7 +684,7 @@ static podi_application *wayland_application_create(void) {
     
     wl_display_dispatch(app->display);
     wl_display_roundtrip(app->display);
-    
+
     if (!app->compositor || !app->xdg_wm_base) {
         wl_display_disconnect(app->display);
         free(app);
@@ -577,6 +707,14 @@ static podi_application *wayland_application_create(void) {
         app->compose_state = xkb_compose_state_new(app->compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
     }
 
+    // Initialize cursor theme
+    if (app->shm) {
+        app->cursor_theme = wl_cursor_theme_load(NULL, 24, app->shm);
+        if (app->cursor_theme) {
+            app->cursor_surface = wl_compositor_create_surface(app->compositor);
+        }
+    }
+
     return (podi_application *)app;
 }
 
@@ -591,6 +729,10 @@ static void wayland_application_destroy(podi_application *app_generic) {
     }
     free(app->common.windows);
     
+    // Cleanup cursor resources
+    if (app->cursor_surface) wl_surface_destroy(app->cursor_surface);
+    if (app->cursor_theme) wl_cursor_theme_destroy(app->cursor_theme);
+
     // Cleanup XKB resources
     if (app->compose_state) xkb_compose_state_unref(app->compose_state);
     if (app->compose_table) xkb_compose_table_unref(app->compose_table);
@@ -598,9 +740,17 @@ static void wayland_application_destroy(podi_application *app_generic) {
     if (app->xkb_keymap) xkb_keymap_unref(app->xkb_keymap);
     if (app->xkb_context) xkb_context_unref(app->xkb_context);
 
+    // Cleanup outputs
+    for (size_t i = 0; i < app->output_count; i++) {
+        if (app->outputs[i]) wl_output_destroy(app->outputs[i]);
+    }
+    free(app->outputs);
+    free(app->output_scales);
+
     if (app->keyboard) wl_keyboard_destroy(app->keyboard);
     if (app->pointer) wl_pointer_destroy(app->pointer);
     if (app->seat) wl_seat_destroy(app->seat);
+    if (app->decoration_manager) zxdg_decoration_manager_v1_destroy(app->decoration_manager);
     if (app->xdg_wm_base) xdg_wm_base_destroy(app->xdg_wm_base);
     if (app->compositor) wl_compositor_destroy(app->compositor);
     if (app->shm) wl_shm_destroy(app->shm);
@@ -623,25 +773,35 @@ static void wayland_application_close(podi_application *app_generic) {
 static bool wayland_application_poll_event(podi_application *app_generic, podi_event *event) {
     podi_application_wayland *app = (podi_application_wayland *)app_generic;
     if (!app || !event) return false;
-    
-    // Process pending events first
-    wl_display_dispatch_pending(app->display);
-    
-    if (get_pending_event(event)) {
-        return true;
-    }
-    
-    // If no pending events, try to read from the socket without blocking
-    if (wl_display_prepare_read(app->display) == 0) {
-        wl_display_read_events(app->display);
+
+    while (true) {
+        // Process pending events first
         wl_display_dispatch_pending(app->display);
-        
+
         if (get_pending_event(event)) {
+            // Check if this event should be handled by resize system
+            if (event->window && podi_handle_resize_event(event->window, event)) {
+                continue; // Event was consumed by resize handler, get next event
+            }
             return true;
         }
+
+        // If no pending events, try to read from the socket without blocking
+        if (wl_display_prepare_read(app->display) == 0) {
+            wl_display_read_events(app->display);
+            wl_display_dispatch_pending(app->display);
+
+            if (get_pending_event(event)) {
+                // Check if this event should be handled by resize system
+                if (event->window && podi_handle_resize_event(event->window, event)) {
+                    continue; // Event was consumed by resize handler, get next event
+                }
+                return true;
+            }
+        }
+
+        return false; // No more events
     }
-    
-    return false;
 }
 
 static podi_window *wayland_window_create(podi_application *app_generic, const char *title, int width, int height) {
@@ -652,19 +812,51 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
     if (!window) return NULL;
     
     window->app = app;
+    window->common.scale_factor = (float)app->max_scale;
+    window->common.title = strdup(title ? title : "Podi Window");
+
+    // Initialize resize state
+    window->common.is_resizing = false;
+    window->common.resize_edge = PODI_RESIZE_EDGE_NONE;
+    window->common.resize_border_width = 8;
+
+    // Store requested physical size - this is what should be returned by get_size/get_framebuffer_size
     window->common.width = width;
     window->common.height = height;
-    window->common.title = strdup(title ? title : "Podi Window");
-    
+
     window->surface = wl_compositor_create_surface(app->compositor);
     window->xdg_surface = xdg_wm_base_get_xdg_surface(app->xdg_wm_base, window->surface);
     window->xdg_toplevel = xdg_surface_get_toplevel(window->xdg_surface);
-    
+
     xdg_surface_add_listener(window->xdg_surface, &xdg_surface_listener, window);
     xdg_toplevel_add_listener(window->xdg_toplevel, &xdg_toplevel_listener, window);
-    
+
     xdg_toplevel_set_title(window->xdg_toplevel, window->common.title);
-    
+
+    // Create decoration object if decoration manager is available
+    if (app->decoration_manager) {
+        window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+            app->decoration_manager, window->xdg_toplevel);
+        zxdg_toplevel_decoration_v1_add_listener(window->decoration, &decoration_listener, window);
+        // Request server-side decorations
+        zxdg_toplevel_decoration_v1_set_mode(window->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
+
+    // Calculate logical size for Wayland (physical size / scale factor)
+    int logical_width = (int)(width / window->common.scale_factor);
+    int logical_height = (int)(height / window->common.scale_factor);
+
+    // Set buffer scale to inform Wayland that our buffer is at physical resolution
+    if (window->common.scale_factor > 1.0f) {
+        wl_surface_set_buffer_scale(window->surface, (int32_t)window->common.scale_factor);
+    }
+
+    // Set the logical window size (this is what Wayland uses for window management)
+    if (logical_width > 0 && logical_height > 0) {
+        // Note: We'll get a configure event that might change these, but this gives a hint
+        // The actual size will be set in the configure event
+    }
+
     wl_surface_commit(window->surface);
     
     while (!window->configured) {
@@ -705,7 +897,10 @@ static void wayland_window_destroy(podi_window *window_generic) {
             break;
         }
     }
-    
+
+    if (window->decoration) {
+        zxdg_toplevel_decoration_v1_destroy(window->decoration);
+    }
     xdg_toplevel_destroy(window->xdg_toplevel);
     xdg_surface_destroy(window->xdg_surface);
     wl_surface_destroy(window->surface);
@@ -730,17 +925,54 @@ static void wayland_window_set_title(podi_window *window_generic, const char *ti
 static void wayland_window_set_size(podi_window *window_generic, int width, int height) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
-    
+
     window->common.width = width;
     window->common.height = height;
 }
 
+static void wayland_window_set_position_and_size(podi_window *window_generic, int x, int y, int width, int height) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window) return;
+
+    // In Wayland, clients can't control window position - compositor handles it
+    // So we just update size and track position for consistency
+    window->common.x = x;
+    window->common.y = y;
+    window->common.width = width;
+    window->common.height = height;
+}
+
+
 static void wayland_window_get_size(podi_window *window_generic, int *width, int *height) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
-    
+
     if (width) *width = window->common.width;
     if (height) *height = window->common.height;
+}
+
+static void wayland_window_get_framebuffer_size(podi_window *window_generic, int *width, int *height) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window) return;
+
+    // Get the raw window dimensions
+    int w = window->common.width;
+    int h = window->common.height;
+
+    // Ensure framebuffer dimensions are divisible by scale factor to satisfy Wayland protocol
+    int scale = (int)window->common.scale_factor;
+    if (scale > 1) {
+        w = (w / scale) * scale;
+        h = (h / scale) * scale;
+    }
+
+    if (width) *width = w;
+    if (height) *height = h;
+}
+
+static float wayland_window_get_scale_factor(podi_window *window_generic) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    return window ? window->common.scale_factor : 1.0f;
 }
 
 static bool wayland_window_should_close(podi_window *window_generic) {
@@ -763,22 +995,105 @@ static bool wayland_window_get_wayland_handles(podi_window *window_generic, podi
     return true;
 }
 
+static void wayland_window_set_cursor(podi_window *window_generic, podi_cursor_shape cursor) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !window->app) return;
+
+    podi_application_wayland *app = window->app;
+    if (!app->cursor_theme || !app->cursor_surface || !app->pointer) return;
+
+    const char *cursor_name;
+    switch (cursor) {
+        case PODI_CURSOR_RESIZE_N:
+            cursor_name = "n-resize";
+            break;
+        case PODI_CURSOR_RESIZE_S:
+            cursor_name = "s-resize";
+            break;
+        case PODI_CURSOR_RESIZE_E:
+            cursor_name = "e-resize";
+            break;
+        case PODI_CURSOR_RESIZE_W:
+            cursor_name = "w-resize";
+            break;
+        case PODI_CURSOR_RESIZE_NE:
+            cursor_name = "ne-resize";
+            break;
+        case PODI_CURSOR_RESIZE_SW:
+            cursor_name = "sw-resize";
+            break;
+        case PODI_CURSOR_RESIZE_NW:
+            cursor_name = "nw-resize";
+            break;
+        case PODI_CURSOR_RESIZE_SE:
+            cursor_name = "se-resize";
+            break;
+        case PODI_CURSOR_DEFAULT:
+        default:
+            cursor_name = "left_ptr";
+            break;
+    }
+
+    struct wl_cursor *wl_cursor = wl_cursor_theme_get_cursor(app->cursor_theme, cursor_name);
+    if (!wl_cursor || wl_cursor->image_count == 0) return;
+
+    struct wl_cursor_image *image = wl_cursor->images[0];
+    struct wl_buffer *buffer = wl_cursor_image_get_buffer(image);
+    if (!buffer) return;
+
+    wl_surface_attach(app->cursor_surface, buffer, 0, 0);
+    wl_surface_damage(app->cursor_surface, 0, 0, image->width, image->height);
+    wl_surface_commit(app->cursor_surface);
+
+    wl_pointer_set_cursor(app->pointer, app->last_input_serial,
+                         app->cursor_surface, image->hotspot_x, image->hotspot_y);
+}
+
+static void wayland_window_begin_interactive_resize(podi_window *window_generic, int edge) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !window->app->seat) return;
+
+    // Convert podi resize edge to XDG resize edge (they match, but let's be explicit)
+    uint32_t xdg_edge;
+    switch (edge) {
+        case 0: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_NONE; break;
+        case 1: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP; break;
+        case 2: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM; break;
+        case 4: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_LEFT; break;
+        case 5: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT; break;
+        case 6: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT; break;
+        case 8: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_RIGHT; break;
+        case 9: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT; break;
+        case 10: xdg_edge = XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT; break;
+        default: return; // Invalid edge
+    }
+
+    // Start interactive resize using the last input serial
+    xdg_toplevel_resize(window->xdg_toplevel, window->app->seat,
+                       window->app->last_input_serial, xdg_edge);
+}
+
 const podi_platform_vtable wayland_vtable = {
     .application_create = wayland_application_create,
     .application_destroy = wayland_application_destroy,
     .application_should_close = wayland_application_should_close,
     .application_close = wayland_application_close,
     .application_poll_event = wayland_application_poll_event,
+    .get_display_scale_factor = wayland_get_display_scale_factor,
     .window_create = wayland_window_create,
     .window_destroy = wayland_window_destroy,
     .window_close = wayland_window_close,
     .window_set_title = wayland_window_set_title,
     .window_set_size = wayland_window_set_size,
+    .window_set_position_and_size = wayland_window_set_position_and_size,
     .window_get_size = wayland_window_get_size,
+    .window_get_framebuffer_size = wayland_window_get_framebuffer_size,
+    .window_get_scale_factor = wayland_window_get_scale_factor,
     .window_should_close = wayland_window_should_close,
+    .window_begin_interactive_resize = wayland_window_begin_interactive_resize,
+    .window_set_cursor = wayland_window_set_cursor,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = wayland_window_get_x11_handles,
     .window_get_wayland_handles = wayland_window_get_wayland_handles,
 #endif
 };
-

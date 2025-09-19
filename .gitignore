@@ -3,3 +3,5 @@ lib
 examples/demo
 src/xdg-shell-client-protocol.h
 src/xdg-shell-protocol.c
+src/xdg-decoration-client-protocol.h
+src/xdg-decoration-protocol.c

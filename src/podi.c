@@ -2,6 +2,7 @@
 #include "internal.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 static bool podi_initialized = false;
 
@@ -38,6 +39,11 @@ bool podi_application_poll_event(podi_application *app, podi_event *event) {
     return podi_platform->application_poll_event(app, event);
 }
 
+float podi_get_display_scale_factor(podi_application *app) {
+    if (!app) return 1.0f;
+    return podi_platform->get_display_scale_factor(app);
+}
+
 podi_window *podi_window_create(podi_application *app, const char *title, int width, int height) {
     if (!app) return NULL;
     return podi_platform->window_create(app, title, width, height);
@@ -63,14 +69,39 @@ void podi_window_set_size(podi_window *window, int width, int height) {
     podi_platform->window_set_size(window, width, height);
 }
 
+void podi_window_set_position_and_size(podi_window *window, int x, int y, int width, int height) {
+    if (!window) return;
+    podi_platform->window_set_position_and_size(window, x, y, width, height);
+}
+
 void podi_window_get_size(podi_window *window, int *width, int *height) {
     if (!window) return;
     podi_platform->window_get_size(window, width, height);
 }
 
+void podi_window_get_framebuffer_size(podi_window *window, int *width, int *height) {
+    if (!window) return;
+    podi_platform->window_get_framebuffer_size(window, width, height);
+}
+
+float podi_window_get_scale_factor(podi_window *window) {
+    if (!window) return 1.0f;
+    return podi_platform->window_get_scale_factor(window);
+}
+
 bool podi_window_should_close(podi_window *window) {
     if (!window) return true;
     return podi_platform->window_should_close(window);
+}
+
+void podi_window_begin_interactive_resize(podi_window *window, int edge) {
+    if (!window) return;
+    podi_platform->window_begin_interactive_resize(window, edge);
+}
+
+void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor) {
+    if (!window) return;
+    podi_platform->window_set_cursor(window, cursor);
 }
 
 #ifdef PODI_PLATFORM_LINUX
@@ -190,6 +221,122 @@ const char *podi_get_modifiers_string(uint32_t modifiers) {
     }
 
     return modifier_buffer;
+}
+
+podi_resize_edge podi_detect_resize_edge(podi_window *window, double x, double y) {
+    if (!window) return PODI_RESIZE_EDGE_NONE;
+
+    podi_window_common *common = (podi_window_common *)window;
+    int border = common->resize_border_width;
+    if (border <= 0) border = 8; // Default border width
+
+    // Convert all coordinates to physical space for consistent resize detection
+    podi_backend_type backend = podi_get_backend();
+    double physical_x = x;
+    double physical_y = y;
+    int width = common->width;  // Always use physical dimensions
+    int height = common->height;
+    int physical_border = border;
+
+    if (backend == PODI_BACKEND_WAYLAND) {
+        // Wayland: Mouse coordinates are logical, convert to physical
+        float scale = common->scale_factor;
+        if (scale <= 0) scale = 1.0f;
+        physical_x = x * scale;
+        physical_y = y * scale;
+        physical_border = (int)(border * scale);  // Scale border too
+    } else {
+        // X11: Mouse coordinates are already physical, but border needs scaling
+        float scale = common->scale_factor;
+        if (scale <= 0) scale = 1.0f;
+        physical_border = (int)(border * scale);  // Scale border for HiDPI
+    }
+
+    bool near_left = physical_x < physical_border;
+    bool near_right = physical_x > width - physical_border;
+    bool near_top = physical_y < physical_border;
+    bool near_bottom = physical_y > height - physical_border;
+
+    // Check corners first (they take priority)
+    if (near_top && near_left) return PODI_RESIZE_EDGE_TOP_LEFT;
+    if (near_top && near_right) return PODI_RESIZE_EDGE_TOP_RIGHT;
+    if (near_bottom && near_left) return PODI_RESIZE_EDGE_BOTTOM_LEFT;
+    if (near_bottom && near_right) return PODI_RESIZE_EDGE_BOTTOM_RIGHT;
+
+    // Check edges
+    if (near_top) return PODI_RESIZE_EDGE_TOP;
+    if (near_bottom) return PODI_RESIZE_EDGE_BOTTOM;
+    if (near_left) return PODI_RESIZE_EDGE_LEFT;
+    if (near_right) return PODI_RESIZE_EDGE_RIGHT;
+
+    return PODI_RESIZE_EDGE_NONE;
+}
+
+podi_cursor_shape podi_resize_edge_to_cursor(podi_resize_edge edge) {
+    switch (edge) {
+        case PODI_RESIZE_EDGE_TOP: return PODI_CURSOR_RESIZE_N;
+        case PODI_RESIZE_EDGE_BOTTOM: return PODI_CURSOR_RESIZE_S;
+        case PODI_RESIZE_EDGE_LEFT: return PODI_CURSOR_RESIZE_W;
+        case PODI_RESIZE_EDGE_RIGHT: return PODI_CURSOR_RESIZE_E;
+        case PODI_RESIZE_EDGE_TOP_LEFT: return PODI_CURSOR_RESIZE_NW;
+        case PODI_RESIZE_EDGE_TOP_RIGHT: return PODI_CURSOR_RESIZE_NE;
+        case PODI_RESIZE_EDGE_BOTTOM_LEFT: return PODI_CURSOR_RESIZE_SW;
+        case PODI_RESIZE_EDGE_BOTTOM_RIGHT: return PODI_CURSOR_RESIZE_SE;
+        default: return PODI_CURSOR_DEFAULT;
+    }
+}
+
+bool podi_handle_resize_event(podi_window *window, podi_event *event) {
+    if (!window || !event) return false;
+
+    podi_backend_type backend = podi_get_backend();
+
+    // X11: Skip custom resize handling - let WM handle it natively
+    if (backend == PODI_BACKEND_X11) {
+        return false;
+    }
+
+    // Wayland: Handle edge detection and trigger native resize, but don't do custom dragging
+
+    podi_window_common *common = (podi_window_common *)window;
+
+    switch (event->type) {
+        case PODI_EVENT_MOUSE_MOVE: {
+            double x = event->mouse_move.x;
+            double y = event->mouse_move.y;
+            common->last_mouse_x = x;
+            common->last_mouse_y = y;
+
+            // For Wayland: Only update cursor, don't handle custom dragging
+            // The compositor will handle the actual resize via xdg_toplevel_resize
+            podi_resize_edge edge = podi_detect_resize_edge(window, x, y);
+            podi_cursor_shape cursor = podi_resize_edge_to_cursor(edge);
+            podi_window_set_cursor(window, cursor);
+            return false; // Let event pass through
+        }
+
+        case PODI_EVENT_MOUSE_BUTTON_DOWN: {
+            if (event->mouse_button.button == PODI_MOUSE_BUTTON_LEFT) {
+                podi_resize_edge edge = podi_detect_resize_edge(window,
+                    common->last_mouse_x, common->last_mouse_y);
+
+                if (edge != PODI_RESIZE_EDGE_NONE) {
+                    // For Wayland: trigger native resize via compositor
+                    podi_window_begin_interactive_resize(window, edge);
+                    return true; // Event consumed
+                }
+            }
+            return false; // Let event pass through
+        }
+
+        case PODI_EVENT_MOUSE_BUTTON_UP: {
+            // For Wayland: no custom resize state to clean up
+            return false; // Let event pass through
+        }
+
+        default:
+            return false; // Let event pass through
+    }
 }
 
 int podi_main(podi_main_func main_func) {

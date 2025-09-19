@@ -55,6 +55,30 @@ typedef enum {
     PODI_MOD_SUPER = 1 << 3
 } podi_mod_flags;
 
+typedef enum {
+    PODI_RESIZE_EDGE_NONE = 0,
+    PODI_RESIZE_EDGE_TOP = 1,
+    PODI_RESIZE_EDGE_BOTTOM = 2,
+    PODI_RESIZE_EDGE_LEFT = 4,
+    PODI_RESIZE_EDGE_TOP_LEFT = 5,
+    PODI_RESIZE_EDGE_BOTTOM_LEFT = 6,
+    PODI_RESIZE_EDGE_RIGHT = 8,
+    PODI_RESIZE_EDGE_TOP_RIGHT = 9,
+    PODI_RESIZE_EDGE_BOTTOM_RIGHT = 10
+} podi_resize_edge;
+
+typedef enum {
+    PODI_CURSOR_DEFAULT = 0,
+    PODI_CURSOR_RESIZE_N,
+    PODI_CURSOR_RESIZE_S,
+    PODI_CURSOR_RESIZE_E,
+    PODI_CURSOR_RESIZE_W,
+    PODI_CURSOR_RESIZE_NE,
+    PODI_CURSOR_RESIZE_NW,
+    PODI_CURSOR_RESIZE_SE,
+    PODI_CURSOR_RESIZE_SW
+} podi_cursor_shape;
+
 typedef struct {
     podi_event_type type;
     podi_window *window;
@@ -102,14 +126,20 @@ void podi_application_destroy(podi_application *app);
 bool podi_application_should_close(podi_application *app);
 void podi_application_close(podi_application *app);
 bool podi_application_poll_event(podi_application *app, podi_event *event);
+float podi_get_display_scale_factor(podi_application *app);
 
 podi_window *podi_window_create(podi_application *app, const char *title, int width, int height);
 void podi_window_destroy(podi_window *window);
 void podi_window_close(podi_window *window);
 void podi_window_set_title(podi_window *window, const char *title);
 void podi_window_set_size(podi_window *window, int width, int height);
+void podi_window_set_position_and_size(podi_window *window, int x, int y, int width, int height);
 void podi_window_get_size(podi_window *window, int *width, int *height);
+void podi_window_get_framebuffer_size(podi_window *window, int *width, int *height);
+float podi_window_get_scale_factor(podi_window *window);
 bool podi_window_should_close(podi_window *window);
+void podi_window_begin_interactive_resize(podi_window *window, int edge);
+void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor);
 
 #ifdef PODI_PLATFORM_LINUX
 typedef struct podi_x11_handles {

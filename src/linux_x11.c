@@ -3,11 +3,24 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/Xresource.h>
+#include <X11/cursorfont.h>
 #include <stdlib.h>
 #include <string.h>
 #include <locale.h>
 #include <stdbool.h>
 #include <stdio.h>
+
+#define NET_WM_MOVERESIZE_SIZE_TOPLEFT     0
+#define NET_WM_MOVERESIZE_SIZE_TOP         1
+#define NET_WM_MOVERESIZE_SIZE_TOPRIGHT    2
+#define NET_WM_MOVERESIZE_SIZE_RIGHT       3
+#define NET_WM_MOVERESIZE_SIZE_BOTTOMRIGHT 4
+#define NET_WM_MOVERESIZE_SIZE_BOTTOM      5
+#define NET_WM_MOVERESIZE_SIZE_BOTTOMLEFT  6
+#define NET_WM_MOVERESIZE_SIZE_LEFT        7
+#define NET_WM_MOVERESIZE_MOVE             8
+#define NET_WM_MOVERESIZE_SOURCE_APPLICATION 1
 
 typedef struct {
     podi_application_common common;
@@ -15,6 +28,7 @@ typedef struct {
     int screen;
     Atom wm_delete_window;
     XIM input_method;
+    Atom net_wm_moveresize;
 } podi_application_x11;
 
 typedef struct {
@@ -102,6 +116,7 @@ static podi_application *x11_application_create(void) {
     
     app->screen = DefaultScreen(app->display);
     app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
+    app->net_wm_moveresize = XInternAtom(app->display, "_NET_WM_MOVERESIZE", False);
     
     // Set locale to user's preference for proper text handling
     setlocale(LC_ALL, "");
@@ -174,7 +189,7 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
     if (!window) return false;
     
     event->window = (podi_window *)window;
-    
+
     switch (xevent.type) {
         case ClientMessage:
             if (xevent.xclient.data.l[0] == (long)app->wm_delete_window) {
@@ -183,17 +198,24 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
             }
             break;
             
-        case ConfigureNotify:
-            if (xevent.xconfigure.width != window->common.width ||
-                xevent.xconfigure.height != window->common.height) {
-                window->common.width = xevent.xconfigure.width;
-                window->common.height = xevent.xconfigure.height;
+        case ConfigureNotify: {
+            int old_width = window->common.width;
+            int old_height = window->common.height;
+
+            window->common.width = xevent.xconfigure.width;
+            window->common.height = xevent.xconfigure.height;
+            window->common.x = xevent.xconfigure.x;
+            window->common.y = xevent.xconfigure.y;
+
+            if (xevent.xconfigure.width != old_width ||
+                xevent.xconfigure.height != old_height) {
                 event->type = PODI_EVENT_WINDOW_RESIZE;
                 event->window_resize.width = xevent.xconfigure.width;
                 event->window_resize.height = xevent.xconfigure.height;
                 return true;
             }
             break;
+        }
             
         case KeyPress: {
             KeySym keysym = XLookupKeysym(&xevent.xkey, 0);
@@ -255,6 +277,7 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
                         case Button2: event->mouse_button.button = PODI_MOUSE_BUTTON_MIDDLE; break;
                         case Button3: event->mouse_button.button = PODI_MOUSE_BUTTON_RIGHT; break;
                     }
+                    // Let X11 window manager handle all resize operations natively
                     return true;
                 case Button4:
                     event->type = PODI_EVENT_MOUSE_SCROLL;
@@ -287,12 +310,14 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
                 case Button3: event->mouse_button.button = PODI_MOUSE_BUTTON_RIGHT; break;
                 default: return false;
             }
+            // Let X11 window manager handle all resize operations natively
             return true;
             
         case MotionNotify:
             event->type = PODI_EVENT_MOUSE_MOVE;
             event->mouse_move.x = xevent.xmotion.x;
             event->mouse_move.y = xevent.xmotion.y;
+            // Let X11 window manager handle all resize operations natively
             return true;
             
         case FocusIn:
@@ -311,8 +336,83 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
             event->type = PODI_EVENT_MOUSE_LEAVE;
             return true;
     }
-    
+
     return false;
+}
+
+static float x11_get_scale_factor(podi_application_x11 *app) {
+    // Try multiple methods to detect HiDPI scaling
+
+    // Method 1: Check environment variables
+    const char *gdk_scale = getenv("GDK_SCALE");
+    if (gdk_scale) {
+        float scale = atof(gdk_scale);
+        if (scale > 0.5f && scale <= 4.0f) {
+            return scale;
+        }
+    }
+
+    const char *qt_scale = getenv("QT_SCALE_FACTOR");
+    if (qt_scale) {
+        float scale = atof(qt_scale);
+        if (scale > 0.5f && scale <= 4.0f) {
+            return scale;
+        }
+    }
+
+    // Method 2: Try Xft.dpi resource
+    char *resource_string = XResourceManagerString(app->display);
+    if (resource_string) {
+        XrmDatabase database = XrmGetStringDatabase(resource_string);
+        if (database) {
+            char *type;
+            XrmValue value;
+            if (XrmGetResource(database, "Xft.dpi", "Xft.Dpi", &type, &value)) {
+                if (value.addr) {
+                    float dpi = atof(value.addr);
+                    float scale = dpi / 96.0f;
+                    XrmDestroyDatabase(database);
+                    if (scale > 0.5f && scale <= 4.0f) {
+                        return scale;
+                    }
+                }
+            }
+            XrmDestroyDatabase(database);
+        }
+    }
+
+    // Method 3: Calculate scale factor based on physical DPI (fallback)
+    int screen_width_mm = DisplayWidthMM(app->display, app->screen);
+    int screen_width_px = DisplayWidth(app->display, app->screen);
+
+    if (screen_width_mm > 0) {
+        // Calculate DPI: pixels per inch = (pixels * 25.4) / mm
+        float dpi = (float)(screen_width_px * 25.4f) / (float)screen_width_mm;
+        float scale = dpi / 96.0f;
+
+        // If DPI is exactly 96, this might be a scaled environment, try to detect actual scale
+        if (dpi >= 95.0f && dpi <= 97.0f) {
+            // Look for typical high-DPI display resolutions that would be scaled
+            if (screen_width_px >= 2560) {
+                return 2.0f;
+            }
+        }
+
+        // Clamp to reasonable range and round to common scale factors
+        if (scale >= 2.75f) return 3.0f;
+        else if (scale >= 2.25f) return 2.5f;
+        else if (scale >= 1.75f) return 2.0f;
+        else if (scale >= 1.25f) return 1.5f;
+        else return 1.0f;
+    }
+
+    return 1.0f;
+}
+
+static float x11_get_display_scale_factor(podi_application *app_generic) {
+    podi_application_x11 *app = (podi_application_x11 *)app_generic;
+    if (!app) return 1.0f;
+    return x11_get_scale_factor(app);
 }
 
 static podi_window *x11_window_create(podi_application *app_generic, const char *title, int width, int height) {
@@ -325,13 +425,53 @@ static podi_window *x11_window_create(podi_application *app_generic, const char 
     window->app = app;
     window->common.width = width;
     window->common.height = height;
+    window->common.x = 0;
+    window->common.y = 0;
+    window->common.min_width = width;
+    window->common.min_height = height;
+    window->common.scale_factor = x11_get_scale_factor(app);
     window->common.title = strdup(title ? title : "Podi Window");
-    
+
+    // Initialize resize state
+    window->common.is_resizing = false;
+    window->common.resize_edge = PODI_RESIZE_EDGE_NONE;
+    window->common.resize_border_width = 8;
+
+    // Create window at the requested size (physical pixels)
+    // Applications can use podi_get_display_scale_factor() to scale to logical size if desired
+
     Window root = RootWindow(app->display, app->screen);
-    window->window = XCreateSimpleWindow(app->display, root, 0, 0, width, height, 1,
-                                        BlackPixel(app->display, app->screen),
-                                        WhitePixel(app->display, app->screen));
-    
+
+    XSetWindowAttributes attrs = {0};
+    attrs.background_pixmap = None;
+    attrs.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | ButtonPressMask |
+                       ButtonReleaseMask | PointerMotionMask | StructureNotifyMask |
+                       FocusChangeMask | EnterWindowMask | LeaveWindowMask;
+    attrs.bit_gravity = StaticGravity;
+    attrs.win_gravity = StaticGravity;
+
+    window->window = XCreateWindow(app->display, root,
+                                   0, 0, width, height,
+                                   0, CopyFromParent, InputOutput, CopyFromParent,
+                                   CWBackPixmap | CWEventMask | CWBitGravity | CWWinGravity,
+                                   &attrs);
+
+    if (!window->window) {
+        free(window->common.title);
+        free(window);
+        return NULL;
+    }
+
+    XSetWindowBackgroundPixmap(app->display, window->window, None);
+
+    // Set reasonable window hints to allow resizing
+    XSizeHints size_hints = {0};
+    size_hints.flags = PWinGravity | PMinSize;
+    size_hints.win_gravity = StaticGravity;
+    size_hints.min_width = 100;  // Minimum reasonable size
+    size_hints.min_height = 100;
+    XSetWMNormalHints(app->display, window->window, &size_hints);
+
     XSetWMProtocols(app->display, window->window, &app->wm_delete_window, 1);
     XStoreName(app->display, window->window, window->common.title);
     
@@ -374,9 +514,9 @@ static podi_window *x11_window_create(podi_application *app_generic, const char 
 static void x11_window_destroy(podi_window *window_generic) {
     podi_window_x11 *window = (podi_window_x11 *)window_generic;
     if (!window) return;
-    
+
     podi_application_x11 *app = window->app;
-    
+
     for (size_t i = 0; i < app->common.window_count; i++) {
         if (app->common.windows[i] == window_generic) {
             memmove(&app->common.windows[i], &app->common.windows[i + 1],
@@ -385,11 +525,11 @@ static void x11_window_destroy(podi_window *window_generic) {
             break;
         }
     }
-    
+
     if (window->input_context) {
         XDestroyIC(window->input_context);
     }
-    
+
     XDestroyWindow(app->display, window->window);
     free(window->common.title);
     free(window);
@@ -413,19 +553,61 @@ static void x11_window_set_title(podi_window *window_generic, const char *title)
 static void x11_window_set_size(podi_window *window_generic, int width, int height) {
     podi_window_x11 *window = (podi_window_x11 *)window_generic;
     if (!window) return;
-    
+
+    window->common.min_width = width;
+    window->common.min_height = height;
     window->common.width = width;
     window->common.height = height;
     XResizeWindow(window->app->display, window->window, width, height);
+
+    // Update WM size hints with reasonable minimum size
+    XSizeHints size_hints = {0};
+    size_hints.flags = PMinSize;
+    size_hints.min_width = 100;
+    size_hints.min_height = 100;
+    XSetWMNormalHints(window->app->display, window->window, &size_hints);
+    XFlush(window->app->display);
+}
+
+static void x11_window_set_position_and_size(podi_window *window_generic, int x, int y, int width, int height) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window) return;
+
+    window->common.x = x;
+    window->common.y = y;
+    window->common.width = width;
+    window->common.height = height;
+    XMoveResizeWindow(window->app->display, window->window, x, y, width, height);
+
+    // Update WM size hints with reasonable minimum size
+    XSizeHints size_hints = {0};
+    size_hints.flags = PMinSize;
+    size_hints.min_width = 100;
+    size_hints.min_height = 100;
+    XSetWMNormalHints(window->app->display, window->window, &size_hints);
     XFlush(window->app->display);
 }
 
 static void x11_window_get_size(podi_window *window_generic, int *width, int *height) {
     podi_window_x11 *window = (podi_window_x11 *)window_generic;
     if (!window) return;
-    
+
     if (width) *width = window->common.width;
     if (height) *height = window->common.height;
+}
+
+static void x11_window_get_framebuffer_size(podi_window *window_generic, int *width, int *height) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window) return;
+
+    // Since windows are created at physical size, framebuffer size equals window size
+    if (width) *width = window->common.width;
+    if (height) *height = window->common.height;
+}
+
+static float x11_window_get_scale_factor(podi_window *window_generic) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    return window ? window->common.scale_factor : 1.0f;
 }
 
 static bool x11_window_should_close(podi_window *window_generic) {
@@ -448,22 +630,69 @@ static bool x11_window_get_wayland_handles(podi_window *window_generic, podi_way
     return false;
 }
 
+static void x11_window_set_cursor(podi_window *window_generic, podi_cursor_shape cursor) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window) return;
+
+    Display *display = window->app->display;
+    Window xwindow = window->window;
+
+    Cursor x11_cursor;
+    switch (cursor) {
+        case PODI_CURSOR_RESIZE_N:
+        case PODI_CURSOR_RESIZE_S:
+            x11_cursor = XCreateFontCursor(display, XC_sb_v_double_arrow);
+            break;
+        case PODI_CURSOR_RESIZE_E:
+        case PODI_CURSOR_RESIZE_W:
+            x11_cursor = XCreateFontCursor(display, XC_sb_h_double_arrow);
+            break;
+        case PODI_CURSOR_RESIZE_NE:
+        case PODI_CURSOR_RESIZE_SW:
+            x11_cursor = XCreateFontCursor(display, XC_top_right_corner);
+            break;
+        case PODI_CURSOR_RESIZE_NW:
+        case PODI_CURSOR_RESIZE_SE:
+            x11_cursor = XCreateFontCursor(display, XC_top_left_corner);
+            break;
+        case PODI_CURSOR_DEFAULT:
+        default:
+            x11_cursor = XCreateFontCursor(display, XC_left_ptr);
+            break;
+    }
+
+    XDefineCursor(display, xwindow, x11_cursor);
+    XFreeCursor(display, x11_cursor);
+    XFlush(display);
+}
+
+static void x11_window_begin_interactive_resize(podi_window *window_generic, int edge) {
+    (void)window_generic;
+    (void)edge;
+    // Let the window manager handle interactive resizes through native decorations
+}
+
 const podi_platform_vtable x11_vtable = {
     .application_create = x11_application_create,
     .application_destroy = x11_application_destroy,
     .application_should_close = x11_application_should_close,
     .application_close = x11_application_close,
     .application_poll_event = x11_application_poll_event,
+    .get_display_scale_factor = x11_get_display_scale_factor,
     .window_create = x11_window_create,
     .window_destroy = x11_window_destroy,
     .window_close = x11_window_close,
     .window_set_title = x11_window_set_title,
     .window_set_size = x11_window_set_size,
+    .window_set_position_and_size = x11_window_set_position_and_size,
     .window_get_size = x11_window_get_size,
+    .window_get_framebuffer_size = x11_window_get_framebuffer_size,
+    .window_get_scale_factor = x11_window_get_scale_factor,
     .window_should_close = x11_window_should_close,
+    .window_begin_interactive_resize = x11_window_begin_interactive_resize,
+    .window_set_cursor = x11_window_set_cursor,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = x11_window_get_x11_handles,
     .window_get_wayland_handles = x11_window_get_wayland_handles,
 #endif
 };
-

@@ -23,11 +23,11 @@ ifeq ($(UNAME_S),Linux)
         CFLAGS += -DPODI_BACKEND_X11_ONLY
     else ifeq ($(BACKEND),wayland)
         PLATFORM_SRC = src/linux_wayland.c src/platform_linux.c
-        PLATFORM_LIBS = -lwayland-client
+        PLATFORM_LIBS = -lwayland-client -lwayland-cursor -lxkbcommon
         CFLAGS += -DPODI_BACKEND_WAYLAND_ONLY
     else
         PLATFORM_SRC = src/linux_x11.c src/linux_wayland.c src/platform_linux.c
-        PLATFORM_LIBS = -lX11 -lwayland-client
+        PLATFORM_LIBS = -lX11 -lwayland-client -lwayland-cursor -lxkbcommon
         CFLAGS += -DPODI_BACKEND_BOTH
     endif
     LIB_EXT = .so
@@ -66,10 +66,10 @@ LIBRARY = $(LIBDIR)/libpodi$(LIB_EXT)
 
 ifeq ($(UNAME_S),Linux)
 ifneq ($(BACKEND),x11)
-    PROTOCOL_HEADERS = $(SRCDIR)/xdg-shell-client-protocol.h
-    PROTOCOL_SOURCES = $(SRCDIR)/xdg-shell-protocol.c
+    PROTOCOL_HEADERS = $(SRCDIR)/xdg-shell-client-protocol.h $(SRCDIR)/xdg-decoration-client-protocol.h
+    PROTOCOL_SOURCES = $(SRCDIR)/xdg-shell-protocol.c $(SRCDIR)/xdg-decoration-protocol.c
     SOURCES += $(PROTOCOL_SOURCES)
-    OBJECTS += $(OBJDIR)/xdg-shell-protocol.o
+    OBJECTS += $(OBJDIR)/xdg-shell-protocol.o $(OBJDIR)/xdg-decoration-protocol.o
 endif
 endif
 
@@ -84,6 +84,12 @@ $(SRCDIR)/xdg-shell-client-protocol.h:
 
 $(SRCDIR)/xdg-shell-protocol.c:
 	wayland-scanner private-code /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml $@
+
+$(SRCDIR)/xdg-decoration-client-protocol.h:
+	wayland-scanner client-header /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml $@
+
+$(SRCDIR)/xdg-decoration-protocol.c:
+	wayland-scanner private-code /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml $@
 
 protocols: $(PROTOCOL_HEADERS) $(PROTOCOL_SOURCES)
 endif
