@@ -60,7 +60,14 @@ typedef struct {
     struct zxdg_toplevel_decoration_v1 *decoration;
     bool configured;
     uint32_t last_input_serial;
+
+    // Client-side decoration support
+    bool has_server_decorations;
+    double last_mouse_x, last_mouse_y;
 } podi_window_wayland;
+
+// Forward declarations
+static void wayland_window_begin_move(podi_window *window_generic);
 
 static uint32_t wayland_mods_to_podi_modifiers(uint32_t mods_depressed) {
     uint32_t modifiers = 0;
@@ -355,6 +362,14 @@ static void pointer_leave(void *data, struct wl_pointer *pointer __attribute__((
 static void pointer_motion(void *data, struct wl_pointer *pointer __attribute__((unused)),
                          uint32_t time __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy) {
     podi_application_wayland *app = (podi_application_wayland *)data;
+
+    // Track mouse position in the current window for title bar detection
+    if (app->common.window_count > 0) {
+        podi_window_wayland *window = (podi_window_wayland *)app->common.windows[0];
+        window->last_mouse_x = wl_fixed_to_double(sx);
+        window->last_mouse_y = wl_fixed_to_double(sy);
+    }
+
     podi_event event = {0};
     event.type = PODI_EVENT_MOUSE_MOVE;
     event.window = app->common.window_count > 0 ? app->common.windows[0] : NULL;
@@ -368,6 +383,41 @@ static void pointer_button(void *data, struct wl_pointer *pointer __attribute__(
                          uint32_t state) {
     podi_application_wayland *app = (podi_application_wayland *)data;
     app->last_input_serial = serial;
+
+    // Check for Alt+Left-click to initiate window move
+    if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED &&
+        (app->modifier_state & PODI_MOD_ALT) &&
+        app->common.window_count > 0) {
+        podi_window *window = app->common.windows[0];
+        wayland_window_begin_move(window);
+        return; // Don't send normal mouse event
+    }
+
+    // Check for title bar click (only if no server decorations and not in resize edge)
+    if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED &&
+        !(app->modifier_state & PODI_MOD_ALT) &&
+        app->common.window_count > 0) {
+        podi_window_wayland *window = (podi_window_wayland *)app->common.windows[0];
+
+
+        // Only activate title bar for windows without server decorations
+        if (!window->has_server_decorations &&
+            window->last_mouse_y >= 0 && window->last_mouse_y <= PODI_TITLE_BAR_HEIGHT) {
+
+            // Check if click is in a resize edge area - if so, let resize take priority
+            podi_resize_edge edge = podi_detect_resize_edge((podi_window *)window,
+                                                          window->last_mouse_x,
+                                                          window->last_mouse_y);
+
+            if (edge == PODI_RESIZE_EDGE_NONE) {
+                wayland_window_begin_move((podi_window *)window);
+                return; // Don't send normal mouse event
+            } else {
+                // Fall through to normal event processing for resize
+            }
+        }
+    }
+
     podi_event_type event_type = (state == WL_POINTER_BUTTON_STATE_PRESSED)
                                 ? PODI_EVENT_MOUSE_BUTTON_DOWN : PODI_EVENT_MOUSE_BUTTON_UP;
 
@@ -602,11 +652,29 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     xdg_wm_base_ping,
 };
 
-static void decoration_configure(void *data __attribute__((unused)),
+static void decoration_configure(void *data,
                                struct zxdg_toplevel_decoration_v1 *decoration __attribute__((unused)),
-                               uint32_t mode __attribute__((unused))) {
+                               uint32_t mode) {
+    podi_window_wayland *window = (podi_window_wayland *)data;
+
     // The compositor has set the decoration mode
-    // We don't need to do anything here as we just want server-side decorations
+    const char *mode_str;
+    switch (mode) {
+        case ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE:
+            mode_str = "client-side";
+            window->has_server_decorations = false;
+            break;
+        case ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE:
+            mode_str = "server-side";
+            window->has_server_decorations = true;
+            break;
+        default:
+            mode_str = "unknown";
+            window->has_server_decorations = false;
+            break;
+    }
+    printf("Podi: Decoration mode set to %s (%u)\n", mode_str, mode);
+    fflush(stdout);
 }
 
 static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
@@ -627,6 +695,8 @@ static void registry_global(void *data, struct wl_registry *registry,
         xdg_wm_base_add_listener(app->xdg_wm_base, &xdg_wm_base_listener, app);
     } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
         app->decoration_manager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
+        printf("Podi: Decoration manager found - server-side decorations available\n");
+        fflush(stdout);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
@@ -667,6 +737,8 @@ static float wayland_get_display_scale_factor(podi_application *app_generic) {
 }
 
 static podi_application *wayland_application_create(void) {
+    printf("Podi: Creating Wayland application\n");
+    fflush(stdout);
     podi_application_wayland *app = calloc(1, sizeof(podi_application_wayland));
     if (!app) return NULL;
 
@@ -820,9 +892,19 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
     window->common.resize_edge = PODI_RESIZE_EDGE_NONE;
     window->common.resize_border_width = 8;
 
-    // Store requested physical size - this is what should be returned by get_size/get_framebuffer_size
+    // Store requested content size (what user wants for rendering)
+    window->common.content_width = width;
+    window->common.content_height = height;
+
+    // Surface size starts the same, will be adjusted if client decorations are needed
     window->common.width = width;
     window->common.height = height;
+
+    // Initialize client-side decoration state
+    window->has_server_decorations = false;
+    window->last_mouse_x = 0.0;
+    window->last_mouse_y = 0.0;
+
 
     window->surface = wl_compositor_create_surface(app->compositor);
     window->xdg_surface = xdg_wm_base_get_xdg_surface(app->xdg_wm_base, window->surface);
@@ -835,16 +917,25 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
 
     // Create decoration object if decoration manager is available
     if (app->decoration_manager) {
+        printf("Podi: Requesting server-side decorations for window\n");
+        fflush(stdout);
         window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
             app->decoration_manager, window->xdg_toplevel);
         zxdg_toplevel_decoration_v1_add_listener(window->decoration, &decoration_listener, window);
         // Request server-side decorations
         zxdg_toplevel_decoration_v1_set_mode(window->decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        window->has_server_decorations = true;  // Assume we'll get server decorations
+    } else {
+        printf("Podi: No decoration manager available - using client-side decorations\n");
+        fflush(stdout);
+        window->has_server_decorations = false;
+        // Adjust surface size to include title bar (scale logical pixels to physical)
+        window->common.height += (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
     }
 
     // Calculate logical size for Wayland (physical size / scale factor)
-    int logical_width = (int)(width / window->common.scale_factor);
-    int logical_height = (int)(height / window->common.scale_factor);
+    int logical_width = (int)(window->common.width / window->common.scale_factor);
+    int logical_height = (int)(window->common.height / window->common.scale_factor);
 
     // Set buffer scale to inform Wayland that our buffer is at physical resolution
     if (window->common.scale_factor > 1.0f) {
@@ -926,8 +1017,16 @@ static void wayland_window_set_size(podi_window *window_generic, int width, int 
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
 
+    // Update content dimensions (what user requested)
+    window->common.content_width = width;
+    window->common.content_height = height;
+
+    // Update surface dimensions (including decorations if needed)
     window->common.width = width;
     window->common.height = height;
+    if (!window->has_server_decorations) {
+        window->common.height += (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
+    }
 }
 
 static void wayland_window_set_position_and_size(podi_window *window_generic, int x, int y, int width, int height) {
@@ -938,8 +1037,17 @@ static void wayland_window_set_position_and_size(podi_window *window_generic, in
     // So we just update size and track position for consistency
     window->common.x = x;
     window->common.y = y;
+
+    // Update content dimensions (what user requested)
+    window->common.content_width = width;
+    window->common.content_height = height;
+
+    // Update surface dimensions (including decorations if needed)
     window->common.width = width;
     window->common.height = height;
+    if (!window->has_server_decorations) {
+        window->common.height += (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
+    }
 }
 
 
@@ -947,19 +1055,39 @@ static void wayland_window_get_size(podi_window *window_generic, int *width, int
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
 
-    if (width) *width = window->common.width;
-    if (height) *height = window->common.height;
+    // Return content dimensions (what user requested)
+    if (width) *width = window->common.content_width;
+    if (height) *height = window->common.content_height;
 }
 
 static void wayland_window_get_framebuffer_size(podi_window *window_generic, int *width, int *height) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
 
-    // Get the raw window dimensions
+    // Get the content dimensions (for rendering)
+    int w = window->common.content_width;
+    int h = window->common.content_height;
+
+    // Ensure framebuffer dimensions are divisible by scale factor to satisfy Wayland protocol
+    int scale = (int)window->common.scale_factor;
+    if (scale > 1) {
+        w = (w / scale) * scale;
+        h = (h / scale) * scale;
+    }
+
+    if (width) *width = w;
+    if (height) *height = h;
+}
+
+static void wayland_window_get_surface_size(podi_window *window_generic, int *width, int *height) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window) return;
+
+    // Get the full surface dimensions (including decorations)
     int w = window->common.width;
     int h = window->common.height;
 
-    // Ensure framebuffer dimensions are divisible by scale factor to satisfy Wayland protocol
+    // Ensure surface dimensions are divisible by scale factor to satisfy Wayland protocol
     int scale = (int)window->common.scale_factor;
     if (scale > 1) {
         w = (w / scale) * scale;
@@ -1073,6 +1201,15 @@ static void wayland_window_begin_interactive_resize(podi_window *window_generic,
                        window->app->last_input_serial, xdg_edge);
 }
 
+static void wayland_window_begin_move(podi_window *window_generic) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !window->app->seat) return;
+
+    // Start interactive move using the last input serial
+    xdg_toplevel_move(window->xdg_toplevel, window->app->seat,
+                     window->app->last_input_serial);
+}
+
 const podi_platform_vtable wayland_vtable = {
     .application_create = wayland_application_create,
     .application_destroy = wayland_application_destroy,
@@ -1088,9 +1225,11 @@ const podi_platform_vtable wayland_vtable = {
     .window_set_position_and_size = wayland_window_set_position_and_size,
     .window_get_size = wayland_window_get_size,
     .window_get_framebuffer_size = wayland_window_get_framebuffer_size,
+    .window_get_surface_size = wayland_window_get_surface_size,
     .window_get_scale_factor = wayland_window_get_scale_factor,
     .window_should_close = wayland_window_should_close,
     .window_begin_interactive_resize = wayland_window_begin_interactive_resize,
+    .window_begin_move = wayland_window_begin_move,
     .window_set_cursor = wayland_window_set_cursor,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = wayland_window_get_x11_handles,

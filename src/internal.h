@@ -3,6 +3,9 @@
 #include "podi.h"
 #include <stddef.h>
 
+// Client-side decoration constants (logical pixels)
+#define PODI_TITLE_BAR_HEIGHT 40
+
 typedef struct podi_platform_vtable {
     podi_application *(*application_create)(void);
     void (*application_destroy)(podi_application *app);
@@ -19,9 +22,11 @@ typedef struct podi_platform_vtable {
     void (*window_set_position_and_size)(podi_window *window, int x, int y, int width, int height);
     void (*window_get_size)(podi_window *window, int *width, int *height);
     void (*window_get_framebuffer_size)(podi_window *window, int *width, int *height);
+    void (*window_get_surface_size)(podi_window *window, int *width, int *height);
     float (*window_get_scale_factor)(podi_window *window);
     bool (*window_should_close)(podi_window *window);
     void (*window_begin_interactive_resize)(podi_window *window, int edge);
+    void (*window_begin_move)(podi_window *window);
     void (*window_set_cursor)(podi_window *window, podi_cursor_shape cursor);
 
 #ifdef PODI_PLATFORM_LINUX
@@ -43,7 +48,8 @@ typedef struct {
     podi_application_common common;
     bool should_close;
     char *title;
-    int width, height;
+    int width, height;  // Total surface dimensions (including decorations)
+    int content_width, content_height;  // Content area dimensions (excluding decorations)
     int x, y;  // Window position
     int min_width, min_height;
     float scale_factor;

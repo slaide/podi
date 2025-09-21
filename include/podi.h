@@ -136,9 +136,11 @@ void podi_window_set_size(podi_window *window, int width, int height);
 void podi_window_set_position_and_size(podi_window *window, int x, int y, int width, int height);
 void podi_window_get_size(podi_window *window, int *width, int *height);
 void podi_window_get_framebuffer_size(podi_window *window, int *width, int *height);
+void podi_window_get_surface_size(podi_window *window, int *width, int *height);
 float podi_window_get_scale_factor(podi_window *window);
 bool podi_window_should_close(podi_window *window);
 void podi_window_begin_interactive_resize(podi_window *window, int edge);
+void podi_window_begin_move(podi_window *window);
 void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor);
 
 #ifdef PODI_PLATFORM_LINUX

@@ -2,6 +2,7 @@
 #include "podi.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef PODI_BACKEND_BOTH
 #include <X11/Xlib.h>
@@ -62,6 +63,9 @@ const char *podi_get_backend_name(void) {
 
 void podi_init_platform(void) {
     if (podi_platform) return;
+
+    fprintf(stderr, "Podi: Initializing platform...\n");
+    fflush(stderr);
     
     // Check environment variable for backend override
     const char *env_backend = getenv("PODI_BACKEND");
@@ -90,13 +94,19 @@ void podi_init_platform(void) {
         default:
 #ifndef PODI_BACKEND_X11_ONLY
             if (wayland_available()) {
+                fprintf(stderr, "Podi: Selected Wayland backend\n");
+                fflush(stderr);
                 podi_platform = &wayland_vtable;
             } else
 #endif
 #ifndef PODI_BACKEND_WAYLAND_ONLY
             if (x11_available()) {
+                printf("Podi: Selected X11 backend\n");
+                fflush(stdout);
                 podi_platform = &x11_vtable;
             } else {
+                printf("Podi: Fallback to X11 backend\n");
+                fflush(stdout);
                 podi_platform = &x11_vtable;
             }
 #endif

@@ -672,6 +672,11 @@ static void x11_window_begin_interactive_resize(podi_window *window_generic, int
     // Let the window manager handle interactive resizes through native decorations
 }
 
+static void x11_window_begin_move(podi_window *window_generic) {
+    (void)window_generic;
+    // Let the window manager handle window moves through native decorations
+}
+
 const podi_platform_vtable x11_vtable = {
     .application_create = x11_application_create,
     .application_destroy = x11_application_destroy,
@@ -687,9 +692,11 @@ const podi_platform_vtable x11_vtable = {
     .window_set_position_and_size = x11_window_set_position_and_size,
     .window_get_size = x11_window_get_size,
     .window_get_framebuffer_size = x11_window_get_framebuffer_size,
+    .window_get_surface_size = x11_window_get_framebuffer_size,  // For X11, surface size = framebuffer size
     .window_get_scale_factor = x11_window_get_scale_factor,
     .window_should_close = x11_window_should_close,
     .window_begin_interactive_resize = x11_window_begin_interactive_resize,
+    .window_begin_move = x11_window_begin_move,
     .window_set_cursor = x11_window_set_cursor,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = x11_window_get_x11_handles,

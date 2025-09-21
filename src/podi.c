@@ -84,6 +84,11 @@ void podi_window_get_framebuffer_size(podi_window *window, int *width, int *heig
     podi_platform->window_get_framebuffer_size(window, width, height);
 }
 
+void podi_window_get_surface_size(podi_window *window, int *width, int *height) {
+    if (!window) return;
+    podi_platform->window_get_surface_size(window, width, height);
+}
+
 float podi_window_get_scale_factor(podi_window *window) {
     if (!window) return 1.0f;
     return podi_platform->window_get_scale_factor(window);
@@ -97,6 +102,11 @@ bool podi_window_should_close(podi_window *window) {
 void podi_window_begin_interactive_resize(podi_window *window, int edge) {
     if (!window) return;
     podi_platform->window_begin_interactive_resize(window, edge);
+}
+
+void podi_window_begin_move(podi_window *window) {
+    if (!window) return;
+    podi_platform->window_begin_move(window);
 }
 
 void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor) {
@@ -254,8 +264,8 @@ podi_resize_edge podi_detect_resize_edge(podi_window *window, double x, double y
 
     bool near_left = physical_x < physical_border;
     bool near_right = physical_x > width - physical_border;
-    bool near_top = physical_y < physical_border;
     bool near_bottom = physical_y > height - physical_border;
+    bool near_top = physical_y < physical_border;
 
     // Check corners first (they take priority)
     if (near_top && near_left) return PODI_RESIZE_EDGE_TOP_LEFT;
