@@ -114,6 +114,16 @@ void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor) {
     podi_platform->window_set_cursor(window, cursor);
 }
 
+void podi_window_set_cursor_mode(podi_window *window, bool locked, bool visible) {
+    if (!window) return;
+    podi_platform->window_set_cursor_mode(window, locked, visible);
+}
+
+void podi_window_get_cursor_position(podi_window *window, double *x, double *y) {
+    if (!window || !x || !y) return;
+    podi_platform->window_get_cursor_position(window, x, y);
+}
+
 #ifdef PODI_PLATFORM_LINUX
 bool podi_window_get_x11_handles(podi_window *window, podi_x11_handles *handles) {
     if (!window || !handles) return false;
@@ -240,31 +250,18 @@ podi_resize_edge podi_detect_resize_edge(podi_window *window, double x, double y
     int border = common->resize_border_width;
     if (border <= 0) border = 8; // Default border width
 
-    // Convert all coordinates to physical space for consistent resize detection
-    podi_backend_type backend = podi_get_backend();
     double physical_x = x;
     double physical_y = y;
-    int width = common->width;  // Always use physical dimensions
-    int height = common->height;
-    int physical_border = border;
+    float scale = common->scale_factor;
+    if (scale <= 0) scale = 1.0f;
 
-    if (backend == PODI_BACKEND_WAYLAND) {
-        // Wayland: Mouse coordinates are logical, convert to physical
-        float scale = common->scale_factor;
-        if (scale <= 0) scale = 1.0f;
-        physical_x = x * scale;
-        physical_y = y * scale;
-        physical_border = (int)(border * scale);  // Scale border too
-    } else {
-        // X11: Mouse coordinates are already physical, but border needs scaling
-        float scale = common->scale_factor;
-        if (scale <= 0) scale = 1.0f;
-        physical_border = (int)(border * scale);  // Scale border for HiDPI
-    }
+    int physical_border = (int)(border * scale);
+    int physical_width = common->width;
+    int physical_height = common->height;
 
     bool near_left = physical_x < physical_border;
-    bool near_right = physical_x > width - physical_border;
-    bool near_bottom = physical_y > height - physical_border;
+    bool near_right = physical_x > physical_width - physical_border;
+    bool near_bottom = physical_y > physical_height - physical_border;
     bool near_top = physical_y < physical_border;
 
     // Check corners first (they take priority)

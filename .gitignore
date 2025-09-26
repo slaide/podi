@@ -5,3 +5,7 @@ src/xdg-shell-client-protocol.h
 src/xdg-shell-protocol.c
 src/xdg-decoration-client-protocol.h
 src/xdg-decoration-protocol.c
+src/pointer-constraints-client-protocol.h
+src/pointer-constraints-protocol.c
+src/relative-pointer-client-protocol.h
+src/relative-pointer-protocol.c

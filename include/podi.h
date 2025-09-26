@@ -96,7 +96,8 @@ typedef struct {
             podi_mouse_button button;
         } mouse_button;
         struct {
-            double x, y;
+            double x, y;         // Absolute position
+            double delta_x, delta_y;  // Delta movement since last frame
         } mouse_move;
         struct {
             double x, y;
@@ -142,6 +143,8 @@ bool podi_window_should_close(podi_window *window);
 void podi_window_begin_interactive_resize(podi_window *window, int edge);
 void podi_window_begin_move(podi_window *window);
 void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor);
+void podi_window_set_cursor_mode(podi_window *window, bool locked, bool visible);
+void podi_window_get_cursor_position(podi_window *window, double *x, double *y);
 
 #ifdef PODI_PLATFORM_LINUX
 typedef struct podi_x11_handles {

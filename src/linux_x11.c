@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "internal.h"
 #include "podi.h"
 #include <X11/Xlib.h>
@@ -5,11 +6,18 @@
 #include <X11/keysym.h>
 #include <X11/Xresource.h>
 #include <X11/cursorfont.h>
+// Conditional XInput2 support - only include if available
+#ifdef X11_XI2_AVAILABLE
+#include <X11/extensions/XInput2.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <locale.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <math.h>
+#include <time.h>
+
 
 #define NET_WM_MOVERESIZE_SIZE_TOPLEFT     0
 #define NET_WM_MOVERESIZE_SIZE_TOP         1
@@ -29,6 +37,9 @@ typedef struct {
     Atom wm_delete_window;
     XIM input_method;
     Atom net_wm_moveresize;
+    Atom net_active_window;
+    int xi2_opcode;
+    bool xi2_available;
 } podi_application_x11;
 
 typedef struct {
@@ -36,7 +47,109 @@ typedef struct {
     podi_application_x11 *app;
     Window window;
     XIC input_context;
+    Cursor invisible_cursor;  // Store invisible cursor for cleanup
+    bool has_focus;
+    bool is_viewable;
+    bool want_cursor_lock;
+    bool pending_cursor_lock;
+    bool xi2_raw_motion_selected;
 } podi_window_x11;
+
+// Forward declarations
+
+static void x11_window_lock_cursor_if_ready(podi_window_x11 *window);
+static void x11_window_release_cursor(podi_window_x11 *window);
+static void x11_request_window_focus(podi_window_x11 *window);
+static void x11_enforce_cursor_bounds(podi_window_x11 *window);
+static void x11_warp_pointer_to_center(podi_window_x11 *window);
+#ifdef X11_XI2_AVAILABLE
+static bool x11_enable_raw_motion(podi_window_x11 *window);
+static void x11_disable_raw_motion(podi_window_x11 *window);
+#endif
+
+static void x11_request_window_focus(podi_window_x11 *window) {
+    if (!window || !window->app) return;
+
+    Display *display = window->app->display;
+    if (!display) return;
+
+    Window root = RootWindow(display, window->app->screen);
+
+    if (window->app->net_active_window != None) {
+        XEvent event = {0};
+        event.xclient.type = ClientMessage;
+        event.xclient.message_type = window->app->net_active_window;
+        event.xclient.display = display;
+        event.xclient.window = window->window;
+        event.xclient.format = 32;
+        event.xclient.data.l[0] = 1;
+        event.xclient.data.l[1] = CurrentTime;
+        event.xclient.data.l[2] = 0;
+        event.xclient.data.l[3] = 0;
+        event.xclient.data.l[4] = 0;
+
+        XSendEvent(display, root, False,
+                   SubstructureRedirectMask | SubstructureNotifyMask,
+                   &event);
+    }
+
+    XRaiseWindow(display, window->window);
+    XFlush(display);
+}
+
+static void x11_warp_pointer_to_center(podi_window_x11 *window) {
+    if (!window || !window->app) return;
+
+    Display *display = window->app->display;
+    const int center_x = (int)window->common.cursor_center_x;
+    const int center_y = (int)window->common.cursor_center_y;
+
+    window->common.cursor_warping = true;
+    XWarpPointer(display, None, window->window, 0, 0, 0, 0,
+                 center_x, center_y);
+    XFlush(display);
+
+    window->common.last_cursor_x = center_x;
+    window->common.last_cursor_y = center_y;
+}
+
+static void x11_enforce_cursor_bounds(podi_window_x11 *window) {
+    if (!window || !(window->common.cursor_locked || window->want_cursor_lock)) return;
+
+    Display *display = window->app->display;
+    const int center_x = (int)window->common.cursor_center_x;
+    const int center_y = (int)window->common.cursor_center_y;
+
+    Window root, child;
+    int root_x, root_y, win_x, win_y;
+    unsigned int mask;
+
+    if (!XQueryPointer(display, window->window, &root, &child,
+                       &root_x, &root_y, &win_x, &win_y, &mask)) {
+        x11_warp_pointer_to_center(window);
+        return;
+    }
+
+    const int margin = 10;
+    const int width = window->common.width;
+    const int height = window->common.height;
+
+    if (width <= margin * 2 || height <= margin * 2) {
+        return;
+    }
+
+    if (win_x < margin || win_x > width - margin ||
+        win_y < margin || win_y > height - margin) {
+        x11_warp_pointer_to_center(window);
+        return;
+    }
+
+    const int center_threshold = 4;
+    if (abs(win_x - center_x) > center_threshold ||
+        abs(win_y - center_y) > center_threshold) {
+        x11_warp_pointer_to_center(window);
+    }
+}
 
 static uint32_t x11_state_to_podi_modifiers(unsigned int state) {
     uint32_t modifiers = 0;
@@ -117,7 +230,8 @@ static podi_application *x11_application_create(void) {
     app->screen = DefaultScreen(app->display);
     app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
     app->net_wm_moveresize = XInternAtom(app->display, "_NET_WM_MOVERESIZE", False);
-    
+    app->net_active_window = XInternAtom(app->display, "_NET_ACTIVE_WINDOW", False);
+
     // Set locale to user's preference for proper text handling
     setlocale(LC_ALL, "");
 
@@ -128,7 +242,24 @@ static podi_application *x11_application_create(void) {
     } else {
         app->input_method = NULL;
     }
-    
+
+    // Initialize XInput2 for raw mouse input (if available)
+    app->xi2_available = false;
+#ifdef X11_XI2_AVAILABLE
+    int xi2_major = 2, xi2_minor = 0;
+    if (XIQueryVersion(app->display, &xi2_major, &xi2_minor) == Success) {
+        int xi2_event_base, xi2_error_base;
+        if (XQueryExtension(app->display, "XInputExtension", &app->xi2_opcode,
+                           &xi2_event_base, &xi2_error_base)) {
+            app->xi2_available = true;
+            printf("XInput2 initialized successfully (opcode=%d, version=%d.%d)\n",
+                   app->xi2_opcode, xi2_major, xi2_minor);
+        }
+    }
+#else
+    printf("XInput2 not available at compile time - using XGrabPointer fallback\n");
+#endif
+
     return (podi_application *)app;
 }
 
@@ -167,6 +298,14 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
     podi_application_x11 *app = (podi_application_x11 *)app_generic;
     if (!app || !event) return false;
     
+    for (size_t i = 0; i < app->common.window_count; ++i) {
+        podi_window_x11 *pending_window = (podi_window_x11 *)app->common.windows[i];
+        if (pending_window) {
+            x11_window_lock_cursor_if_ready(pending_window);
+            x11_enforce_cursor_bounds(pending_window);
+        }
+    }
+
     if (!XPending(app->display)) return false;
     
     XEvent xevent;
@@ -190,6 +329,49 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
     
     event->window = (podi_window *)window;
 
+    // Handle XInput2 events (if available)
+#ifdef X11_XI2_AVAILABLE
+    if (xevent.type == GenericEvent && xevent.xcookie.extension == app->xi2_opcode) {
+        if (XGetEventData(app->display, &xevent.xcookie)) {
+            XIDeviceEvent *xidev = (XIDeviceEvent *)xevent.xcookie.data;
+
+            if (xevent.xcookie.evtype == XI_RawMotion && window->common.cursor_locked) {
+                XIRawEvent *raw = (XIRawEvent *)xevent.xcookie.data;
+
+                // Extract raw motion values
+                double *values = raw->valuators.values;
+                double delta_x = 0.0, delta_y = 0.0;
+
+                // Get raw delta values from valuators
+                if (raw->valuators.mask_len > 0) {
+                    int valuator_index = 0;
+                    for (int i = 0; i < 2 && i < raw->valuators.mask_len * 8; i++) {
+                        if (XIMaskIsSet(raw->valuators.mask, i)) {
+                            if (i == 0) delta_x = values[valuator_index];      // X axis
+                            else if (i == 1) delta_y = values[valuator_index]; // Y axis
+                            valuator_index++;
+                        }
+                    }
+                }
+
+                event->type = PODI_EVENT_MOUSE_MOVE;
+                event->mouse_move.x = window->common.cursor_center_x;
+                event->mouse_move.y = window->common.cursor_center_y;
+                event->mouse_move.delta_x = delta_x;
+                event->mouse_move.delta_y = delta_y;
+
+                x11_enforce_cursor_bounds(window);
+
+                XFreeEventData(app->display, &xevent.xcookie);
+                return true;
+            }
+
+            XFreeEventData(app->display, &xevent.xcookie);
+        }
+        return false; // XI2 event but not one we care about
+    }
+#endif
+
     switch (xevent.type) {
         case ClientMessage:
             if (xevent.xclient.data.l[0] == (long)app->wm_delete_window) {
@@ -197,6 +379,31 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
                 return true;
             }
             break;
+
+        case MapNotify:
+            window->is_viewable = true;
+            if (window->want_cursor_lock && !window->common.cursor_locked) {
+                window->pending_cursor_lock = true;
+                x11_window_lock_cursor_if_ready(window);
+            }
+            return false;
+
+        case UnmapNotify:
+            window->is_viewable = false;
+            if (window->common.cursor_locked) {
+                x11_window_release_cursor(window);
+            }
+            if (window->want_cursor_lock) {
+                window->pending_cursor_lock = true;
+            }
+            return false;
+
+        case DestroyNotify:
+            window->is_viewable = false;
+            window->want_cursor_lock = false;
+            window->pending_cursor_lock = false;
+            x11_window_release_cursor(window);
+            return false;
             
         case ConfigureNotify: {
             int old_width = window->common.width;
@@ -209,6 +416,12 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
 
             if (xevent.xconfigure.width != old_width ||
                 xevent.xconfigure.height != old_height) {
+                // Update cursor center if cursor is locked
+                if (window->common.cursor_locked) {
+                    window->common.cursor_center_x = window->common.width / 2.0;
+                    window->common.cursor_center_y = window->common.height / 2.0;
+                }
+
                 event->type = PODI_EVENT_WINDOW_RESIZE;
                 event->window_resize.width = xevent.xconfigure.width;
                 event->window_resize.height = xevent.xconfigure.height;
@@ -313,28 +526,146 @@ static bool x11_application_poll_event(podi_application *app_generic, podi_event
             // Let X11 window manager handle all resize operations natively
             return true;
             
-        case MotionNotify:
+        case MotionNotify: {
             event->type = PODI_EVENT_MOUSE_MOVE;
-            event->mouse_move.x = xevent.xmotion.x;
-            event->mouse_move.y = xevent.xmotion.y;
-            // Let X11 window manager handle all resize operations natively
+
+            // Find the window for cursor locking check
+            podi_window_x11 *podi_window = NULL;
+            for (size_t i = 0; i < app->common.window_count; i++) {
+                podi_window_x11 *win = (podi_window_x11*)app->common.windows[i];
+                if (win->window == xevent.xmotion.window) {
+                    podi_window = win;
+                    break;
+                }
+            }
+
+            int motion_x = xevent.xmotion.x;
+            int motion_y = xevent.xmotion.y;
+
+            if (podi_window && podi_window->common.cursor_warping) {
+                podi_window->common.cursor_warping = false;
+                podi_window->common.last_cursor_x = motion_x;
+                podi_window->common.last_cursor_y = motion_y;
+                if (!app->xi2_available) {
+                    return false;
+                }
+            }
+
+            if (podi_window && podi_window->common.cursor_locked && !app->xi2_available) {
+                // Only use old XWarpPointer method when XInput2 is not available
+                // Calculate deltas from actual mouse position to center
+                double center_x = podi_window->common.cursor_center_x;
+                double center_y = podi_window->common.cursor_center_y;
+                double delta_x = motion_x - center_x;
+                double delta_y = motion_y - center_y;
+
+                // Report actual mouse position
+                event->mouse_move.x = motion_x;
+                event->mouse_move.y = motion_y;
+                event->mouse_move.delta_x = delta_x;
+                event->mouse_move.delta_y = delta_y;
+
+                // Always warp back to center when locked (aggressive warping)
+                x11_warp_pointer_to_center(podi_window);
+            } else if (podi_window && podi_window->common.cursor_locked && app->xi2_available) {
+                // When XInput2 is available and cursor is locked, ignore regular motion events
+                // XI_RawMotion events will handle relative motion instead
+                podi_window->common.last_cursor_x = motion_x;
+                podi_window->common.last_cursor_y = motion_y;
+                return false;
+            } else {
+                // Normal unlocked mode - report actual position and calculate deltas from last position
+                event->mouse_move.x = motion_x;
+                event->mouse_move.y = motion_y;
+
+                if (podi_window) {
+                    event->mouse_move.delta_x = motion_x - podi_window->common.last_cursor_x;
+                    event->mouse_move.delta_y = motion_y - podi_window->common.last_cursor_y;
+
+                    // Update last position
+                    podi_window->common.last_cursor_x = motion_x;
+                    podi_window->common.last_cursor_y = motion_y;
+                } else {
+                    // Fallback if window not found
+                    event->mouse_move.delta_x = 0.0;
+                    event->mouse_move.delta_y = 0.0;
+                }
+            }
+
             return true;
+        }
             
         case FocusIn:
+            window->has_focus = true;
+            if (window->want_cursor_lock && !window->common.cursor_locked) {
+                window->pending_cursor_lock = true;
+                x11_window_lock_cursor_if_ready(window);
+            }
             event->type = PODI_EVENT_WINDOW_FOCUS;
             return true;
             
-        case FocusOut:
+        case FocusOut: {
+            bool focus_lost_to_other_window =
+                (xevent.xfocus.mode == NotifyNormal || xevent.xfocus.mode == NotifyUngrab) &&
+                (xevent.xfocus.detail == NotifyAncestor ||
+                 xevent.xfocus.detail == NotifyNonlinear ||
+                 xevent.xfocus.detail == NotifyNonlinearVirtual);
+
+            if (focus_lost_to_other_window) {
+                window->has_focus = false;
+            }
+
+            if (window->common.cursor_locked && focus_lost_to_other_window) {
+                x11_window_release_cursor(window);
+            }
+
+            if (window->want_cursor_lock) {
+                window->pending_cursor_lock = true;
+            }
+
             event->type = PODI_EVENT_WINDOW_UNFOCUS;
             return true;
+        }
 
-        case EnterNotify:
+        case EnterNotify: {
+            // Find window and check if cursor is locked
+            podi_window_x11 *window = NULL;
+            for (size_t i = 0; i < app->common.window_count; i++) {
+                podi_window_x11 *win = (podi_window_x11*)app->common.windows[i];
+                if (win->window == xevent.xany.window) {
+                    window = win;
+                    break;
+                }
+            }
+
+            // Skip enter events when cursor is locked
+            if (window && window->common.cursor_locked) {
+                return false;
+            }
+
             event->type = PODI_EVENT_MOUSE_ENTER;
             return true;
+        }
 
-        case LeaveNotify:
+        case LeaveNotify: {
+            // Find window and check if cursor is locked
+            podi_window_x11 *window = NULL;
+            for (size_t i = 0; i < app->common.window_count; i++) {
+                podi_window_x11 *win = (podi_window_x11*)app->common.windows[i];
+                if (win->window == xevent.xany.window) {
+                    window = win;
+                    break;
+                }
+            }
+
+            // Skip leave events when cursor is locked
+            if (window && window->common.cursor_locked) {
+                return false;
+            }
+
             event->type = PODI_EVENT_MOUSE_LEAVE;
             return true;
+        }
     }
 
     return false;
@@ -437,6 +768,14 @@ static podi_window *x11_window_create(podi_application *app_generic, const char 
     window->common.resize_edge = PODI_RESIZE_EDGE_NONE;
     window->common.resize_border_width = 8;
 
+    // Initialize cursor state
+    window->common.cursor_locked = false;
+    window->common.cursor_visible = true;
+    window->common.last_cursor_x = 0.0;
+    window->common.last_cursor_y = 0.0;
+    window->common.cursor_warping = false;
+    window->invisible_cursor = None;
+
     // Create window at the requested size (physical pixels)
     // Applications can use podi_get_display_scale_factor() to scale to logical size if desired
 
@@ -524,6 +863,15 @@ static void x11_window_destroy(podi_window *window_generic) {
             app->common.window_count--;
             break;
         }
+    }
+
+    window->want_cursor_lock = false;
+    window->pending_cursor_lock = false;
+    x11_window_release_cursor(window);
+
+    // Clean up invisible cursor if created
+    if (window->invisible_cursor != None) {
+        XFreeCursor(app->display, window->invisible_cursor);
     }
 
     if (window->input_context) {
@@ -666,6 +1014,216 @@ static void x11_window_set_cursor(podi_window *window_generic, podi_cursor_shape
     XFlush(display);
 }
 
+#ifdef X11_XI2_AVAILABLE
+static bool x11_enable_raw_motion(podi_window_x11 *window) {
+    if (!window || !window->app->xi2_available || window->xi2_raw_motion_selected) {
+        return window && window->xi2_raw_motion_selected;
+    }
+
+    XIEventMask mask;
+    unsigned char data[XIMaskLen(XI_LASTEVENT)] = {0};
+
+    mask.deviceid = XIAllMasterDevices;
+    mask.mask_len = sizeof(data);
+    mask.mask = data;
+
+    XISetMask(data, XI_RawMotion);
+
+    if (XISelectEvents(window->app->display,
+                       DefaultRootWindow(window->app->display),
+                       &mask, 1) == Success) {
+        window->xi2_raw_motion_selected = true;
+        printf("DEBUG: XInput2 XI_RawMotion events enabled for relative mouse mode\n");
+        return true;
+    }
+
+    printf("ERROR: Failed to enable XInput2 XI_RawMotion events\n");
+    return false;
+}
+
+static void x11_disable_raw_motion(podi_window_x11 *window) {
+    if (!window || !window->app->xi2_available || !window->xi2_raw_motion_selected) {
+        return;
+    }
+
+    XIEventMask mask;
+    unsigned char data[XIMaskLen(XI_LASTEVENT)] = {0};
+
+    mask.deviceid = XIAllMasterDevices;
+    mask.mask_len = sizeof(data);
+    mask.mask = data;
+
+    XISelectEvents(window->app->display,
+                   DefaultRootWindow(window->app->display),
+                   &mask, 1);
+    window->xi2_raw_motion_selected = false;
+    printf("DEBUG: XInput2 XI_RawMotion events disabled\n");
+}
+#endif
+
+static void x11_window_release_cursor(podi_window_x11 *window) {
+    if (!window) return;
+
+#ifdef X11_XI2_AVAILABLE
+    bool had_raw_motion = window->xi2_raw_motion_selected;
+    x11_disable_raw_motion(window);
+#else
+    bool had_raw_motion = false;
+#endif
+
+    bool had_grab = window->common.cursor_locked;
+    if (had_grab) {
+        XUngrabPointer(window->app->display, CurrentTime);
+    }
+
+    window->common.cursor_locked = false;
+    window->common.cursor_warping = false;
+
+    if (had_grab || had_raw_motion) {
+        XFlush(window->app->display);
+    }
+}
+
+static void x11_window_lock_cursor_if_ready(podi_window_x11 *window) {
+    if (!window || !window->pending_cursor_lock) {
+        return;
+    }
+
+    if (!window->is_viewable) {
+        return;
+    }
+
+    if (!window->has_focus) {
+        x11_request_window_focus(window);
+        return;
+    }
+
+    Display *display = window->app->display;
+    Window xwindow = window->window;
+
+    x11_warp_pointer_to_center(window);
+
+    const int max_attempts = 4;
+    int grab_result = GrabSuccess;
+    bool grab_established = false;
+
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        grab_result = XGrabPointer(
+            display, xwindow, True,
+            PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
+            GrabModeAsync, GrabModeAsync, xwindow,
+            window->invisible_cursor, CurrentTime
+        );
+
+        if (grab_result == GrabSuccess) {
+            grab_established = true;
+            break;
+        }
+
+        if (grab_result == AlreadyGrabbed) {
+            XUngrabPointer(display, CurrentTime);
+        }
+
+        printf("WARNING: XGrabPointer failed: %d (attempt %d)\n", grab_result, attempt + 1);
+
+        struct timespec wait_time;
+        wait_time.tv_sec = 0;
+        wait_time.tv_nsec = 2000000L * (attempt + 1); // 2ms, 4ms, ...
+        nanosleep(&wait_time, NULL);
+    }
+
+    if (!grab_established) {
+        window->pending_cursor_lock = true;
+        return;
+    }
+
+#ifdef X11_XI2_AVAILABLE
+    x11_enable_raw_motion(window);
+#endif
+
+    window->common.cursor_locked = true;
+    window->pending_cursor_lock = false;
+
+    x11_warp_pointer_to_center(window);
+
+    printf("DEBUG: Pointer grab established (raw motion %s)\n",
+           window->xi2_raw_motion_selected ? "enabled" : "disabled");
+}
+
+static void x11_window_set_cursor_mode(podi_window *window_generic, bool locked, bool visible) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window) return;
+
+    Display *display = window->app->display;
+    Window xwindow = window->window;
+
+    window->common.cursor_visible = visible;
+
+    if (locked) {
+        window->want_cursor_lock = true;
+        window->pending_cursor_lock = !window->common.cursor_locked;
+
+        // Calculate window center for cursor locking
+        window->common.cursor_center_x = window->common.width / 2.0;
+        window->common.cursor_center_y = window->common.height / 2.0;
+
+        // Create invisible cursor first
+        if (window->invisible_cursor == None) {
+            // Create a truly invisible cursor (1x1 transparent bitmap)
+            char data = 0;
+            Pixmap blank = XCreateBitmapFromData(display, xwindow, &data, 1, 1);
+            XColor dummy = {0};
+            window->invisible_cursor = XCreatePixmapCursor(display, blank, blank, &dummy, &dummy, 0, 0);
+            XFreePixmap(display, blank);
+        }
+
+        // Set invisible cursor on window
+        XDefineCursor(display, xwindow, window->invisible_cursor);
+        x11_window_lock_cursor_if_ready(window);
+    } else {
+        window->want_cursor_lock = false;
+        window->pending_cursor_lock = false;
+
+        x11_window_release_cursor(window);
+
+        // Handle cursor visibility for non-locked mode
+        if (!visible) {
+            // Create temporary invisible cursor for non-locked mode
+            char data = 0;
+            Pixmap blank = XCreateBitmapFromData(display, xwindow, &data, 1, 1);
+            XColor dummy = {0};
+            Cursor temp_invisible = XCreatePixmapCursor(display, blank, blank, &dummy, &dummy, 0, 0);
+            XDefineCursor(display, xwindow, temp_invisible);
+            XFreeCursor(display, temp_invisible);
+            XFreePixmap(display, blank);
+        } else {
+            // Restore default cursor
+            x11_window_set_cursor(window_generic, PODI_CURSOR_DEFAULT);
+        }
+    }
+
+    XFlush(display);
+}
+
+static void x11_window_get_cursor_position(podi_window *window_generic, double *x, double *y) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window || !x || !y) return;
+
+    Display *display = window->app->display;
+    Window xwindow = window->window;
+    Window root, child;
+    int root_x, root_y, win_x, win_y;
+    unsigned int mask;
+
+    if (XQueryPointer(display, xwindow, &root, &child, &root_x, &root_y, &win_x, &win_y, &mask)) {
+        *x = (double)win_x;
+        *y = (double)win_y;
+    } else {
+        *x = 0.0;
+        *y = 0.0;
+    }
+}
+
 static void x11_window_begin_interactive_resize(podi_window *window_generic, int edge) {
     (void)window_generic;
     (void)edge;
@@ -698,8 +1256,11 @@ const podi_platform_vtable x11_vtable = {
     .window_begin_interactive_resize = x11_window_begin_interactive_resize,
     .window_begin_move = x11_window_begin_move,
     .window_set_cursor = x11_window_set_cursor,
+    .window_set_cursor_mode = x11_window_set_cursor_mode,
+    .window_get_cursor_position = x11_window_get_cursor_position,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = x11_window_get_x11_handles,
     .window_get_wayland_handles = x11_window_get_wayland_handles,
 #endif
 };
+// Pointer barrier direction constants are available in newer XFixes headers.

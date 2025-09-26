@@ -28,6 +28,8 @@ typedef struct podi_platform_vtable {
     void (*window_begin_interactive_resize)(podi_window *window, int edge);
     void (*window_begin_move)(podi_window *window);
     void (*window_set_cursor)(podi_window *window, podi_cursor_shape cursor);
+    void (*window_set_cursor_mode)(podi_window *window, bool locked, bool visible);
+    void (*window_get_cursor_position)(podi_window *window, double *x, double *y);
 
 #ifdef PODI_PLATFORM_LINUX
     bool (*window_get_x11_handles)(podi_window *window, podi_x11_handles *handles);
@@ -62,6 +64,13 @@ typedef struct {
     int resize_start_window_x, resize_start_window_y;  // Window position at resize start
     double last_mouse_x, last_mouse_y;
     int resize_border_width;
+
+    // Cursor state
+    bool cursor_locked;
+    bool cursor_visible;
+    double cursor_center_x, cursor_center_y;  // Window center coordinates for locking
+    double last_cursor_x, last_cursor_y;      // Last cursor position for delta calculation
+    bool cursor_warping;                       // Flag to track when we're warping cursor (X11 only)
 } podi_window_common;
 
 void podi_init_platform(void);

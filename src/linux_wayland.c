@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "internal.h"
 #include "podi.h"
 #include <wayland-client.h>
@@ -5,10 +6,13 @@
 #include <wayland-cursor.h>
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-client-protocol.h"
+#include "pointer-constraints-client-protocol.h"
+#include "relative-pointer-client-protocol.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <linux/input-event-codes.h>
 #include <locale.h>
@@ -49,6 +53,11 @@ typedef struct {
     // Cursor theme support
     struct wl_cursor_theme *cursor_theme;
     struct wl_surface *cursor_surface;
+    struct wl_buffer *hidden_cursor_buffer;
+
+    // Pointer constraint protocols
+    struct zwp_pointer_constraints_v1 *pointer_constraints;
+    struct zwp_relative_pointer_manager_v1 *relative_pointer_manager;
 } podi_application_wayland;
 
 typedef struct {
@@ -64,10 +73,20 @@ typedef struct {
     // Client-side decoration support
     bool has_server_decorations;
     double last_mouse_x, last_mouse_y;
+
+    // Cursor locking support
+    struct zwp_locked_pointer_v1 *locked_pointer;
+    struct zwp_relative_pointer_v1 *relative_pointer;
+    bool is_locked_active;
+    bool pending_cursor_update;
 } podi_window_wayland;
 
 // Forward declarations
 static void wayland_window_begin_move(podi_window *window_generic);
+static void wayland_update_cursor_visibility(podi_window_wayland *window);
+
+static struct wl_buffer* wayland_get_hidden_cursor_buffer(podi_application_wayland *app);
+static void wayland_set_hidden_cursor(podi_window_wayland *window);
 
 static uint32_t wayland_mods_to_podi_modifiers(uint32_t mods_depressed) {
     uint32_t modifiers = 0;
@@ -77,6 +96,10 @@ static uint32_t wayland_mods_to_podi_modifiers(uint32_t mods_depressed) {
     if (mods_depressed & 64) modifiers |= PODI_MOD_SUPER; // Super/Meta
     return modifiers;
 }
+
+// Forward declarations
+static void wayland_window_set_cursor(podi_window *window_generic, podi_cursor_shape cursor);
+static const struct zwp_locked_pointer_v1_listener locked_pointer_listener;
 
 static podi_key wayland_keycode_to_podi_key(uint32_t key) {
     switch (key) {
@@ -326,14 +349,191 @@ static const struct wl_keyboard_listener keyboard_listener = {
     keyboard_repeat_info,
 };
 
+// Relative pointer motion listener
+static void relative_pointer_motion(void *data, struct zwp_relative_pointer_v1 *zwp_relative_pointer __attribute__((unused)),
+                                   uint32_t utime_hi __attribute__((unused)), uint32_t utime_lo __attribute__((unused)),
+                                   wl_fixed_t dx, wl_fixed_t dy,
+                                   wl_fixed_t dx_unaccel __attribute__((unused)), wl_fixed_t dy_unaccel __attribute__((unused))) {
+    podi_window_wayland *window = (podi_window_wayland *)data;
+
+    if (window && window->common.cursor_locked) {
+        double delta_x = wl_fixed_to_double(dx);
+        double delta_y = wl_fixed_to_double(dy);
+
+        printf("DEBUG: Relative pointer motion: dx=%.2f, dy=%.2f\n", delta_x, delta_y);
+        fflush(stdout);
+
+        // Send a mouse move event with relative motion as deltas
+        podi_event event = {0};
+        event.type = PODI_EVENT_MOUSE_MOVE;
+        event.window = (podi_window*)window;
+
+        // For locked cursor, we don't update absolute position
+        event.mouse_move.x = window->common.cursor_center_x;
+        event.mouse_move.y = window->common.cursor_center_y;
+
+        // Use relative motion as deltas
+        event.mouse_move.delta_x = delta_x;
+        event.mouse_move.delta_y = delta_y;
+
+        add_pending_event(&event);
+
+        printf("DEBUG: Relative motion processed - persistent lock maintained\n");
+        fflush(stdout);
+    }
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    relative_pointer_motion,
+};
+
+// Locked pointer event handlers
+static void locked_pointer_locked(void *data, struct zwp_locked_pointer_v1 *zwp_locked_pointer __attribute__((unused))) {
+    podi_window_wayland *window = (podi_window_wayland *)data;
+    printf("DEBUG: Pointer locked successfully\n");
+    fflush(stdout);
+
+    // Mark lock as active
+    window->is_locked_active = true;
+
+    if (window && window->app && window->app->pointer && window->app->last_input_serial) {
+        // Now try to hide the cursor since we have a valid lock
+        wl_pointer_set_cursor(window->app->pointer, window->app->last_input_serial, NULL, 0, 0);
+        wl_display_flush(window->app->display);
+        printf("DEBUG: Cursor hidden after lock\n");
+        fflush(stdout);
+    }
+}
+
+static void locked_pointer_unlocked(void *data, struct zwp_locked_pointer_v1 *zwp_locked_pointer __attribute__((unused))) {
+    podi_window_wayland *window = (podi_window_wayland *)data;
+    printf("DEBUG: Pointer unlocked\n");
+    fflush(stdout);
+
+    // Mark lock as inactive
+    window->is_locked_active = false;
+
+    // Restore cursor visibility when unlocked
+    if (window && window->common.cursor_visible) {
+        wayland_window_set_cursor((podi_window*)window, PODI_CURSOR_DEFAULT);
+    }
+}
+
+static const struct zwp_locked_pointer_v1_listener locked_pointer_listener = {
+    locked_pointer_locked,
+    locked_pointer_unlocked,
+};
+
+static void wayland_update_cursor_visibility(podi_window_wayland *window) {
+    if (!window || !window->app) return;
+
+    podi_application_wayland *app = window->app;
+    if (!app->pointer || app->last_input_serial == 0) {
+        window->pending_cursor_update = true;
+        return;
+    }
+
+    window->pending_cursor_update = false;
+
+    if (!window->common.cursor_visible || window->common.cursor_locked) {
+        wayland_set_hidden_cursor(window);
+    } else {
+        wayland_window_set_cursor((podi_window*)window, PODI_CURSOR_DEFAULT);
+        wl_display_flush(app->display);
+    }
+}
+
+static int wayland_create_shm_file(size_t size) {
+    char template[] = "/tmp/podi-cursor-XXXXXX";
+    int fd = mkstemp(template);
+    if (fd < 0) {
+        return -1;
+    }
+    unlink(template);
+    if (ftruncate(fd, size) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static struct wl_buffer* wayland_get_hidden_cursor_buffer(podi_application_wayland *app) {
+    if (!app || !app->shm) return NULL;
+    if (app->hidden_cursor_buffer) return app->hidden_cursor_buffer;
+
+    const int width = 1;
+    const int height = 1;
+    const int stride = width * 4;
+    const size_t size = stride * height;
+
+    int fd = wayland_create_shm_file(size);
+    if (fd < 0) {
+        return NULL;
+    }
+
+    void *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) {
+        close(fd);
+        return NULL;
+    }
+
+    memset(data, 0, size);
+
+    munmap(data, size);
+
+    struct wl_shm_pool *pool = wl_shm_create_pool(app->shm, fd, size);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
+                                                         width, height, stride,
+                                                         WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+
+    app->hidden_cursor_buffer = buffer;
+    return buffer;
+}
+
+static void wayland_set_hidden_cursor(podi_window_wayland *window) {
+    if (!window || !window->app || !window->app->pointer) return;
+
+    struct wl_buffer *buffer = wayland_get_hidden_cursor_buffer(window->app);
+    if (!buffer) {
+        wl_pointer_set_cursor(window->app->pointer, window->app->last_input_serial, NULL, 0, 0);
+        wl_display_flush(window->app->display);
+        return;
+    }
+
+    wl_surface_attach(window->app->cursor_surface, buffer, 0, 0);
+    wl_surface_damage(window->app->cursor_surface, 0, 0, 1, 1);
+    wl_surface_commit(window->app->cursor_surface);
+    wl_pointer_set_cursor(window->app->pointer, window->app->last_input_serial,
+                          window->app->cursor_surface, 0, 0);
+    wl_display_flush(window->app->display);
+}
+
 static void pointer_enter(void *data, struct wl_pointer *pointer __attribute__((unused)),
-                        uint32_t serial __attribute__((unused)), struct wl_surface *surface,
-                        wl_fixed_t sx __attribute__((unused)), wl_fixed_t sy __attribute__((unused))) {
+                        uint32_t serial, struct wl_surface *surface,
+                        wl_fixed_t sx, wl_fixed_t sy) {
     podi_application_wayland *app = (podi_application_wayland *)data;
+
+    // Store the input serial for cursor operations
+    app->last_input_serial = serial;
 
     for (size_t i = 0; i < app->common.window_count; i++) {
         podi_window_wayland *window = (podi_window_wayland *)app->common.windows[i];
         if (window && window->surface == surface) {
+            // Initialize cursor position to avoid wrong deltas on first motion
+            double enter_x = wl_fixed_to_double(sx);
+            double enter_y = wl_fixed_to_double(sy);
+            window->common.last_cursor_x = enter_x;
+            window->common.last_cursor_y = enter_y;
+
+            printf("DEBUG: Cursor entered window at (%.2f, %.2f)\n", enter_x, enter_y);
+            fflush(stdout);
+
+            // Apply desired cursor visibility now that we have a valid serial
+            window->pending_cursor_update = false;
+            wayland_update_cursor_visibility(window);
+
             podi_event event = {0};
             event.type = PODI_EVENT_MOUSE_ENTER;
             event.window = (podi_window *)window;
@@ -363,19 +563,59 @@ static void pointer_motion(void *data, struct wl_pointer *pointer __attribute__(
                          uint32_t time __attribute__((unused)), wl_fixed_t sx, wl_fixed_t sy) {
     podi_application_wayland *app = (podi_application_wayland *)data;
 
+    double new_x = wl_fixed_to_double(sx);
+    double new_y = wl_fixed_to_double(sy);
+
     // Track mouse position in the current window for title bar detection
     if (app->common.window_count > 0) {
         podi_window_wayland *window = (podi_window_wayland *)app->common.windows[0];
-        window->last_mouse_x = wl_fixed_to_double(sx);
-        window->last_mouse_y = wl_fixed_to_double(sy);
-    }
 
-    podi_event event = {0};
-    event.type = PODI_EVENT_MOUSE_MOVE;
-    event.window = app->common.window_count > 0 ? app->common.windows[0] : NULL;
-    event.mouse_move.x = wl_fixed_to_double(sx);
-    event.mouse_move.y = wl_fixed_to_double(sy);
-    add_pending_event(&event);
+        // Update window's mouse tracking (used for title bar detection)
+        window->last_mouse_x = new_x;
+        window->last_mouse_y = new_y;
+
+        // Don't send mouse events when cursor is locked - check both state and active flag
+        if (window->common.cursor_locked || window->is_locked_active) {
+            printf("DEBUG: Skipping normal pointer motion - cursor is locked (state=%s, active=%s)\n",
+                   window->common.cursor_locked ? "true" : "false",
+                   window->is_locked_active ? "true" : "false");
+            fflush(stdout);
+            return; // Relative pointer events will be handled by relative_pointer_motion
+        }
+
+        double scale = window->common.scale_factor > 0.0 ? window->common.scale_factor : 1.0;
+
+        // Send normal mouse move event for unlocked cursor
+        podi_event event = {0};
+        event.type = PODI_EVENT_MOUSE_MOVE;
+        event.window = (podi_window*)window;
+        event.mouse_move.x = new_x * scale;
+        event.mouse_move.y = new_y * scale;
+
+        // Calculate deltas from last position
+        double delta_logical_x = new_x - window->common.last_cursor_x;
+        double delta_logical_y = new_y - window->common.last_cursor_y;
+        double delta_physical_x = delta_logical_x * scale;
+        double delta_physical_y = delta_logical_y * scale;
+        event.mouse_move.delta_x = delta_physical_x;
+        event.mouse_move.delta_y = delta_physical_y;
+
+        printf("DEBUG: Wayland motion: pos=(%.2f, %.2f) delta=(%.2f, %.2f)\n",
+               new_x * scale, new_y * scale, delta_physical_x, delta_physical_y);
+        fflush(stdout);
+
+        window->common.last_cursor_x = new_x;
+        window->common.last_cursor_y = new_y;
+
+        bool consumed = false;
+        if (event.window && podi_handle_resize_event(event.window, &event)) {
+            consumed = true;
+        }
+
+        if (!consumed) {
+            add_pending_event(&event);
+        }
+    }
 }
 
 static void pointer_button(void *data, struct wl_pointer *pointer __attribute__((unused)),
@@ -383,6 +623,13 @@ static void pointer_button(void *data, struct wl_pointer *pointer __attribute__(
                          uint32_t state) {
     podi_application_wayland *app = (podi_application_wayland *)data;
     app->last_input_serial = serial;
+
+    if (app->common.window_count > 0) {
+        podi_window_wayland *window = (podi_window_wayland *)app->common.windows[0];
+        if (window && window->pending_cursor_update) {
+            wayland_update_cursor_visibility(window);
+        }
+    }
 
     // Check for Alt+Left-click to initiate window move
     if (button == BTN_LEFT && state == WL_POINTER_BUTTON_STATE_PRESSED &&
@@ -404,17 +651,9 @@ static void pointer_button(void *data, struct wl_pointer *pointer __attribute__(
         if (!window->has_server_decorations &&
             window->last_mouse_y >= 0 && window->last_mouse_y <= PODI_TITLE_BAR_HEIGHT) {
 
-            // Check if click is in a resize edge area - if so, let resize take priority
-            podi_resize_edge edge = podi_detect_resize_edge((podi_window *)window,
-                                                          window->last_mouse_x,
-                                                          window->last_mouse_y);
-
-            if (edge == PODI_RESIZE_EDGE_NONE) {
-                wayland_window_begin_move((podi_window *)window);
-                return; // Don't send normal mouse event
-            } else {
-                // Fall through to normal event processing for resize
-            }
+            // Start window move for title bar clicks
+            wayland_window_begin_move((podi_window *)window);
+            return; // Don't send normal mouse event
         }
     }
 
@@ -437,7 +676,14 @@ static void pointer_button(void *data, struct wl_pointer *pointer __attribute__(
         default:
             return;
     }
-    add_pending_event(&event);
+    bool consumed = false;
+    if (event.window && podi_handle_resize_event(event.window, &event)) {
+        consumed = true;
+    }
+
+    if (!consumed) {
+        add_pending_event(&event);
+    }
 }
 
 static void pointer_axis(void *data __attribute__((unused)), struct wl_pointer *pointer __attribute__((unused)),
@@ -590,6 +836,10 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
                                  struct wl_array *states __attribute__((unused))) {
     podi_window_wayland *window = (podi_window_wayland *)data;
 
+    printf("DEBUG: xdg_toplevel_configure called: width=%d, height=%d, scale=%.1f\n",
+           width, height, window->common.scale_factor);
+    fflush(stdout);
+
     // Convert logical size from Wayland to physical size for consistency with X11
     if (width > 0 && height > 0) {
         int physical_width = (int)(width * window->common.scale_factor);
@@ -605,6 +855,14 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
         if (physical_width != window->common.width || physical_height != window->common.height) {
             window->common.width = physical_width;
             window->common.height = physical_height;
+            window->common.content_width = physical_width;
+            window->common.content_height = physical_height;
+
+            // Update cursor center if cursor is locked
+            if (window->common.cursor_locked) {
+                window->common.cursor_center_x = window->common.content_width / 2.0;
+                window->common.cursor_center_y = window->common.content_height / 2.0;
+            }
 
             podi_event event = {0};
             event.type = PODI_EVENT_WINDOW_RESIZE;
@@ -685,6 +943,9 @@ static void registry_global(void *data, struct wl_registry *registry,
                           uint32_t name, const char *interface, uint32_t version __attribute__((unused))) {
     podi_application_wayland *app = (podi_application_wayland *)data;
 
+    printf("DEBUG: Found Wayland protocol: %s\n", interface);
+    fflush(stdout);
+
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         app->compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
@@ -699,6 +960,14 @@ static void registry_global(void *data, struct wl_registry *registry,
         fflush(stdout);
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         app->shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
+    } else if (strcmp(interface, zwp_pointer_constraints_v1_interface.name) == 0) {
+        app->pointer_constraints = wl_registry_bind(registry, name, &zwp_pointer_constraints_v1_interface, 1);
+        printf("Podi: Pointer constraints found - cursor locking available\n");
+        fflush(stdout);
+    } else if (strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        app->relative_pointer_manager = wl_registry_bind(registry, name, &zwp_relative_pointer_manager_v1_interface, 1);
+        printf("Podi: Relative pointer manager found - relative movement available\n");
+        fflush(stdout);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
         // Add output to our tracking list
         if (app->output_count >= app->output_capacity) {
@@ -802,6 +1071,7 @@ static void wayland_application_destroy(podi_application *app_generic) {
     free(app->common.windows);
     
     // Cleanup cursor resources
+    if (app->hidden_cursor_buffer) wl_buffer_destroy(app->hidden_cursor_buffer);
     if (app->cursor_surface) wl_surface_destroy(app->cursor_surface);
     if (app->cursor_theme) wl_cursor_theme_destroy(app->cursor_theme);
 
@@ -851,10 +1121,6 @@ static bool wayland_application_poll_event(podi_application *app_generic, podi_e
         wl_display_dispatch_pending(app->display);
 
         if (get_pending_event(event)) {
-            // Check if this event should be handled by resize system
-            if (event->window && podi_handle_resize_event(event->window, event)) {
-                continue; // Event was consumed by resize handler, get next event
-            }
             return true;
         }
 
@@ -864,10 +1130,6 @@ static bool wayland_application_poll_event(podi_application *app_generic, podi_e
             wl_display_dispatch_pending(app->display);
 
             if (get_pending_event(event)) {
-                // Check if this event should be handled by resize system
-                if (event->window && podi_handle_resize_event(event->window, event)) {
-                    continue; // Event was consumed by resize handler, get next event
-                }
                 return true;
             }
         }
@@ -904,6 +1166,18 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
     window->has_server_decorations = false;
     window->last_mouse_x = 0.0;
     window->last_mouse_y = 0.0;
+
+    // Initialize cursor state
+    window->common.cursor_locked = false;
+    window->common.cursor_visible = true;
+    window->common.last_cursor_x = 0.0;
+    window->common.last_cursor_y = 0.0;
+    window->common.cursor_warping = false;
+
+    // Initialize pointer constraint objects
+    window->locked_pointer = NULL;
+    window->relative_pointer = NULL;
+    window->pending_cursor_update = false;
 
 
     window->surface = wl_compositor_create_surface(app->compositor);
@@ -987,6 +1261,14 @@ static void wayland_window_destroy(podi_window *window_generic) {
             app->common.window_count--;
             break;
         }
+    }
+
+    // Clean up cursor locking resources
+    if (window->locked_pointer) {
+        zwp_locked_pointer_v1_destroy(window->locked_pointer);
+    }
+    if (window->relative_pointer) {
+        zwp_relative_pointer_v1_destroy(window->relative_pointer);
     }
 
     if (window->decoration) {
@@ -1177,6 +1459,109 @@ static void wayland_window_set_cursor(podi_window *window_generic, podi_cursor_s
                          app->cursor_surface, image->hotspot_x, image->hotspot_y);
 }
 
+static void wayland_window_set_cursor_mode(podi_window *window_generic, bool locked, bool visible) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !window->app) return;
+
+    podi_application_wayland *app = window->app;
+
+    printf("DEBUG: Setting cursor mode - locked=%s, visible=%s, old_locked=%s\n",
+           locked ? "true" : "false", visible ? "true" : "false",
+           window->common.cursor_locked ? "true" : "false");
+    fflush(stdout);
+
+    window->common.cursor_locked = locked;
+    window->common.cursor_visible = visible;
+
+    // Reset lock active state when changing modes
+    if (!locked) {
+        window->is_locked_active = false;
+    }
+
+    if (locked) {
+        // Calculate window center for cursor locking
+        window->common.cursor_center_x = window->common.content_width / 2.0;
+        window->common.cursor_center_y = window->common.content_height / 2.0;
+
+        // Hide cursor before requesting pointer constraints to ensure compositor applies it
+        wayland_update_cursor_visibility(window);
+
+        printf("DEBUG: Setting cursor locked mode - protocols available: constraints=%p, relative=%p, pointer=%p\n",
+               (void*)app->pointer_constraints, (void*)app->relative_pointer_manager, (void*)app->pointer);
+        fflush(stdout);
+
+        // Create locked pointer and relative pointer if protocols are available
+        if (app->pointer_constraints && app->relative_pointer_manager && app->pointer) {
+            // Destroy existing objects if they exist
+            if (window->locked_pointer) {
+                zwp_locked_pointer_v1_destroy(window->locked_pointer);
+                window->locked_pointer = NULL;
+            }
+            if (window->relative_pointer) {
+                zwp_relative_pointer_v1_destroy(window->relative_pointer);
+                window->relative_pointer = NULL;
+            }
+
+            // Create locked pointer to confine cursor to window
+            window->locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+                app->pointer_constraints,
+                window->surface,
+                app->pointer,
+                NULL, // region - NULL means entire surface
+                ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT
+            );
+
+            printf("DEBUG: Created locked pointer: %p\n", (void*)window->locked_pointer);
+            fflush(stdout);
+
+            // Add listener to get lock/unlock events
+            if (window->locked_pointer) {
+                zwp_locked_pointer_v1_add_listener(window->locked_pointer, &locked_pointer_listener, window);
+                printf("DEBUG: Added locked pointer listener\n");
+                fflush(stdout);
+            }
+
+            // Create relative pointer for delta motion events
+            window->relative_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+                app->relative_pointer_manager,
+                app->pointer
+            );
+
+            printf("DEBUG: Created relative pointer: %p\n", (void*)window->relative_pointer);
+            fflush(stdout);
+
+            if (window->relative_pointer) {
+                zwp_relative_pointer_v1_add_listener(window->relative_pointer, &relative_pointer_listener, window);
+                printf("DEBUG: Added relative pointer listener\n");
+                fflush(stdout);
+            }
+        } else {
+            printf("DEBUG: Cannot lock cursor - missing protocols\n");
+            fflush(stdout);
+        }
+    } else {
+        // Unlock cursor - destroy pointer constraint objects
+        if (window->locked_pointer) {
+            zwp_locked_pointer_v1_destroy(window->locked_pointer);
+            window->locked_pointer = NULL;
+        }
+        if (window->relative_pointer) {
+            zwp_relative_pointer_v1_destroy(window->relative_pointer);
+            window->relative_pointer = NULL;
+        }
+    }
+
+    wayland_update_cursor_visibility(window);
+}
+
+static void wayland_window_get_cursor_position(podi_window *window_generic, double *x, double *y) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !x || !y) return;
+
+    *x = window->last_mouse_x;
+    *y = window->last_mouse_y;
+}
+
 static void wayland_window_begin_interactive_resize(podi_window *window_generic, int edge) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window || !window->app->seat) return;
@@ -1231,6 +1616,8 @@ const podi_platform_vtable wayland_vtable = {
     .window_begin_interactive_resize = wayland_window_begin_interactive_resize,
     .window_begin_move = wayland_window_begin_move,
     .window_set_cursor = wayland_window_set_cursor,
+    .window_set_cursor_mode = wayland_window_set_cursor_mode,
+    .window_get_cursor_position = wayland_window_get_cursor_position,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = wayland_window_get_x11_handles,
     .window_get_wayland_handles = wayland_window_get_wayland_handles,

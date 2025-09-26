@@ -17,9 +17,16 @@ endif
 
 ifeq ($(UNAME_S),Linux)
     BACKEND ?= both
+    # Check for XInput2 development headers and library
+    XI2_AVAILABLE := $(shell pkg-config --exists xi 2>/dev/null && echo "yes" || echo "no")
+
     ifeq ($(BACKEND),x11)
         PLATFORM_SRC = src/linux_x11.c src/platform_linux.c
         PLATFORM_LIBS = -lX11
+        ifeq ($(XI2_AVAILABLE),yes)
+            PLATFORM_LIBS += -lXi
+            CFLAGS += -DX11_XI2_AVAILABLE
+        endif
         CFLAGS += -DPODI_BACKEND_X11_ONLY
     else ifeq ($(BACKEND),wayland)
         PLATFORM_SRC = src/linux_wayland.c src/platform_linux.c
@@ -28,6 +35,10 @@ ifeq ($(UNAME_S),Linux)
     else
         PLATFORM_SRC = src/linux_x11.c src/linux_wayland.c src/platform_linux.c
         PLATFORM_LIBS = -lX11 -lwayland-client -lwayland-cursor -lxkbcommon
+        ifeq ($(XI2_AVAILABLE),yes)
+            PLATFORM_LIBS += -lXi
+            CFLAGS += -DX11_XI2_AVAILABLE
+        endif
         CFLAGS += -DPODI_BACKEND_BOTH
     endif
     LIB_EXT = .so
@@ -66,10 +77,19 @@ LIBRARY = $(LIBDIR)/libpodi$(LIB_EXT)
 
 ifeq ($(UNAME_S),Linux)
 ifneq ($(BACKEND),x11)
-    PROTOCOL_HEADERS = $(SRCDIR)/xdg-shell-client-protocol.h $(SRCDIR)/xdg-decoration-client-protocol.h
-    PROTOCOL_SOURCES = $(SRCDIR)/xdg-shell-protocol.c $(SRCDIR)/xdg-decoration-protocol.c
+    PROTOCOL_HEADERS = $(SRCDIR)/xdg-shell-client-protocol.h \
+                       $(SRCDIR)/xdg-decoration-client-protocol.h \
+                       $(SRCDIR)/pointer-constraints-client-protocol.h \
+                       $(SRCDIR)/relative-pointer-client-protocol.h
+    PROTOCOL_SOURCES = $(SRCDIR)/xdg-shell-protocol.c \
+                       $(SRCDIR)/xdg-decoration-protocol.c \
+                       $(SRCDIR)/pointer-constraints-protocol.c \
+                       $(SRCDIR)/relative-pointer-protocol.c
     SOURCES += $(PROTOCOL_SOURCES)
-    OBJECTS += $(OBJDIR)/xdg-shell-protocol.o $(OBJDIR)/xdg-decoration-protocol.o
+    OBJECTS += $(OBJDIR)/xdg-shell-protocol.o \
+               $(OBJDIR)/xdg-decoration-protocol.o \
+               $(OBJDIR)/pointer-constraints-protocol.o \
+               $(OBJDIR)/relative-pointer-protocol.o
 endif
 endif
 
@@ -90,6 +110,18 @@ $(SRCDIR)/xdg-decoration-client-protocol.h:
 
 $(SRCDIR)/xdg-decoration-protocol.c:
 	wayland-scanner private-code /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml $@
+
+$(SRCDIR)/pointer-constraints-client-protocol.h:
+	wayland-scanner client-header /usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml $@
+
+$(SRCDIR)/pointer-constraints-protocol.c:
+	wayland-scanner private-code /usr/share/wayland-protocols/unstable/pointer-constraints/pointer-constraints-unstable-v1.xml $@
+
+$(SRCDIR)/relative-pointer-client-protocol.h:
+	wayland-scanner client-header /usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml $@
+
+$(SRCDIR)/relative-pointer-protocol.c:
+	wayland-scanner private-code /usr/share/wayland-protocols/unstable/relative-pointer/relative-pointer-unstable-v1.xml $@
 
 protocols: $(PROTOCOL_HEADERS) $(PROTOCOL_SOURCES)
 endif
