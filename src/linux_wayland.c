@@ -79,11 +79,14 @@ typedef struct {
     struct zwp_relative_pointer_v1 *relative_pointer;
     bool is_locked_active;
     bool pending_cursor_update;
+    bool fullscreen_requested;
 } podi_window_wayland;
 
 // Forward declarations
 static void wayland_window_begin_move(podi_window *window_generic);
 static void wayland_update_cursor_visibility(podi_window_wayland *window);
+static void wayland_window_set_fullscreen_exclusive(podi_window *window_generic, bool enabled);
+static bool wayland_window_is_fullscreen_exclusive(podi_window *window_generic);
 
 static struct wl_buffer* wayland_get_hidden_cursor_buffer(podi_application_wayland *app);
 static void wayland_set_hidden_cursor(podi_window_wayland *window);
@@ -649,6 +652,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer __attribute__(
 
         // Only activate title bar for windows without server decorations
         if (!window->has_server_decorations &&
+            !window->common.fullscreen_exclusive &&
             window->last_mouse_y >= 0 && window->last_mouse_y <= PODI_TITLE_BAR_HEIGHT) {
 
             // Start window move for title bar clicks
@@ -836,6 +840,19 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
                                  struct wl_array *states __attribute__((unused))) {
     podi_window_wayland *window = (podi_window_wayland *)data;
 
+    bool is_fullscreen = false;
+    if (states) {
+        uint32_t *state;
+        wl_array_for_each(state, states) {
+            if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) {
+                is_fullscreen = true;
+                break;
+            }
+        }
+    }
+
+    window->common.fullscreen_exclusive = is_fullscreen;
+
     printf("DEBUG: xdg_toplevel_configure called: width=%d, height=%d, scale=%.1f\n",
            width, height, window->common.scale_factor);
     fflush(stdout);
@@ -857,6 +874,12 @@ static void xdg_toplevel_configure(void *data, struct xdg_toplevel *xdg_toplevel
             window->common.height = physical_height;
             window->common.content_width = physical_width;
             window->common.content_height = physical_height;
+
+            if (!is_fullscreen) {
+                window->common.restore_geometry_valid = true;
+                window->common.restore_width = physical_width;
+                window->common.restore_height = physical_height;
+            }
 
             // Update cursor center if cursor is locked
             if (window->common.cursor_locked) {
@@ -1173,6 +1196,13 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
     window->common.last_cursor_x = 0.0;
     window->common.last_cursor_y = 0.0;
     window->common.cursor_warping = false;
+    window->common.fullscreen_exclusive = false;
+    window->common.restore_geometry_valid = false;
+    window->common.restore_x = 0;
+    window->common.restore_y = 0;
+    window->common.restore_width = width;
+    window->common.restore_height = height;
+    window->fullscreen_requested = false;
 
     // Initialize pointer constraint objects
     window->locked_pointer = NULL;
@@ -1251,7 +1281,11 @@ static podi_window *wayland_window_create(podi_application *app_generic, const c
 static void wayland_window_destroy(podi_window *window_generic) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window) return;
-    
+
+    if (window->common.fullscreen_exclusive) {
+        wayland_window_set_fullscreen_exclusive(window_generic, false);
+    }
+
     podi_application_wayland *app = window->app;
     
     for (size_t i = 0; i < app->common.window_count; i++) {
@@ -1306,7 +1340,7 @@ static void wayland_window_set_size(podi_window *window_generic, int width, int 
     // Update surface dimensions (including decorations if needed)
     window->common.width = width;
     window->common.height = height;
-    if (!window->has_server_decorations) {
+    if (!window->has_server_decorations && !window->common.fullscreen_exclusive) {
         window->common.height += (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
     }
 }
@@ -1327,7 +1361,7 @@ static void wayland_window_set_position_and_size(podi_window *window_generic, in
     // Update surface dimensions (including decorations if needed)
     window->common.width = width;
     window->common.height = height;
-    if (!window->has_server_decorations) {
+    if (!window->has_server_decorations && !window->common.fullscreen_exclusive) {
         window->common.height += (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
     }
 }
@@ -1562,6 +1596,37 @@ static void wayland_window_get_cursor_position(podi_window *window_generic, doub
     *y = window->last_mouse_y;
 }
 
+static void wayland_window_set_fullscreen_exclusive(podi_window *window_generic, bool enabled) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window || !window->app || !window->xdg_toplevel) return;
+
+    if (window->fullscreen_requested == enabled &&
+        window->common.fullscreen_exclusive == enabled) {
+        return;
+    }
+
+    window->fullscreen_requested = enabled;
+    window->common.fullscreen_exclusive = enabled;
+
+    if (enabled) {
+        xdg_toplevel_set_fullscreen(window->xdg_toplevel, NULL);
+    } else {
+        xdg_toplevel_unset_fullscreen(window->xdg_toplevel);
+    }
+
+    if (window->app->display) {
+        wl_display_flush(window->app->display);
+    }
+}
+
+static bool wayland_window_is_fullscreen_exclusive(podi_window *window_generic) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window) {
+        return false;
+    }
+    return window->common.fullscreen_exclusive;
+}
+
 static void wayland_window_begin_interactive_resize(podi_window *window_generic, int edge) {
     podi_window_wayland *window = (podi_window_wayland *)window_generic;
     if (!window || !window->app->seat) return;
@@ -1618,6 +1683,8 @@ const podi_platform_vtable wayland_vtable = {
     .window_set_cursor = wayland_window_set_cursor,
     .window_set_cursor_mode = wayland_window_set_cursor_mode,
     .window_get_cursor_position = wayland_window_get_cursor_position,
+    .window_set_fullscreen_exclusive = wayland_window_set_fullscreen_exclusive,
+    .window_is_fullscreen_exclusive = wayland_window_is_fullscreen_exclusive,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = wayland_window_get_x11_handles,
     .window_get_wayland_handles = wayland_window_get_wayland_handles,

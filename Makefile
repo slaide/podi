@@ -22,7 +22,7 @@ ifeq ($(UNAME_S),Linux)
 
     ifeq ($(BACKEND),x11)
         PLATFORM_SRC = src/linux_x11.c src/platform_linux.c
-        PLATFORM_LIBS = -lX11
+        PLATFORM_LIBS = -lX11 -ldl
         ifeq ($(XI2_AVAILABLE),yes)
             PLATFORM_LIBS += -lXi
             CFLAGS += -DX11_XI2_AVAILABLE
@@ -30,11 +30,11 @@ ifeq ($(UNAME_S),Linux)
         CFLAGS += -DPODI_BACKEND_X11_ONLY
     else ifeq ($(BACKEND),wayland)
         PLATFORM_SRC = src/linux_wayland.c src/platform_linux.c
-        PLATFORM_LIBS = -lwayland-client -lwayland-cursor -lxkbcommon
+        PLATFORM_LIBS = -lwayland-client -lwayland-cursor -lxkbcommon -ldl
         CFLAGS += -DPODI_BACKEND_WAYLAND_ONLY
     else
         PLATFORM_SRC = src/linux_x11.c src/linux_wayland.c src/platform_linux.c
-        PLATFORM_LIBS = -lX11 -lwayland-client -lwayland-cursor -lxkbcommon
+        PLATFORM_LIBS = -lX11 -lwayland-client -lwayland-cursor -lxkbcommon -ldl
         ifeq ($(XI2_AVAILABLE),yes)
             PLATFORM_LIBS += -lXi
             CFLAGS += -DX11_XI2_AVAILABLE

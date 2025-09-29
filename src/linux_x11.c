@@ -6,6 +6,23 @@
 #include <X11/keysym.h>
 #include <X11/Xresource.h>
 #include <X11/cursorfont.h>
+#include <X11/Xatom.h>
+#if defined(__has_include)
+#  if __has_include(<X11/extensions/Xrandr.h>)
+#    define PODI_HAS_XRANDR 1
+#  else
+#    define PODI_HAS_XRANDR 0
+#  endif
+#else
+#  define PODI_HAS_XRANDR 1
+#endif
+
+#if PODI_HAS_XRANDR
+#include <X11/extensions/Xrandr.h>
+#endif
+#if PODI_HAS_XRANDR
+#include <dlfcn.h>
+#endif
 // Conditional XInput2 support - only include if available
 #ifdef X11_XI2_AVAILABLE
 #include <X11/extensions/XInput2.h>
@@ -38,8 +55,14 @@ typedef struct {
     XIM input_method;
     Atom net_wm_moveresize;
     Atom net_active_window;
+    Atom net_wm_state;
+    Atom net_wm_state_fullscreen;
+    Atom net_wm_bypass_compositor;
     int xi2_opcode;
     bool xi2_available;
+    bool randr_available;
+    int randr_event_base;
+    int randr_error_base;
 } podi_application_x11;
 
 typedef struct {
@@ -53,7 +76,37 @@ typedef struct {
     bool want_cursor_lock;
     bool pending_cursor_lock;
     bool xi2_raw_motion_selected;
+    bool restore_crtc_valid;
+#if PODI_HAS_XRANDR
+    RROutput fullscreen_output;
+    RRCrtc fullscreen_crtc;
+    RRMode restore_mode;
+    Rotation restore_rotation;
+    int restore_crtc_x;
+    int restore_crtc_y;
+    int restore_crtc_width;
+    int restore_crtc_height;
+#endif
 } podi_window_x11;
+
+#if PODI_HAS_XRANDR
+typedef struct {
+    void *library;
+    Bool (*query_extension)(Display *, int *, int *);
+    Status (*query_version)(Display *, int *, int *);
+    XRRScreenResources *(*get_screen_resources_current)(Display *, Window);
+    XRROutputInfo *(*get_output_info)(Display *, XRRScreenResources *, RROutput);
+    XRRCrtcInfo *(*get_crtc_info)(Display *, XRRScreenResources *, RRCrtc);
+    void (*free_screen_resources)(XRRScreenResources *);
+    void (*free_output_info)(XRROutputInfo *);
+    void (*free_crtc_info)(XRRCrtcInfo *);
+    Status (*set_crtc_config)(Display *, XRRScreenResources *, RRCrtc, Time,
+                              int, int, RRMode, Rotation, RROutput *, int);
+    RROutput (*get_output_primary)(Display *, Window);
+} x11_randr_api;
+
+static x11_randr_api g_xrandr = {0};
+#endif
 
 // Forward declarations
 
@@ -66,6 +119,8 @@ static void x11_warp_pointer_to_center(podi_window_x11 *window);
 static bool x11_enable_raw_motion(podi_window_x11 *window);
 static void x11_disable_raw_motion(podi_window_x11 *window);
 #endif
+static void x11_window_set_fullscreen_exclusive(podi_window *window_generic, bool enabled);
+static bool x11_window_is_fullscreen_exclusive(podi_window *window_generic);
 
 static void x11_request_window_focus(podi_window_x11 *window) {
     if (!window || !window->app) return;
@@ -151,6 +206,106 @@ static void x11_enforce_cursor_bounds(podi_window_x11 *window) {
     }
 }
 
+#define NET_WM_STATE_REMOVE 0
+#define NET_WM_STATE_ADD 1
+
+#if PODI_HAS_XRANDR
+static const XRRModeInfo *x11_find_mode_info(const XRRScreenResources *resources, RRMode mode) {
+    if (!resources) return NULL;
+    for (int i = 0; i < resources->nmode; ++i) {
+        if (resources->modes[i].id == mode) {
+            return &resources->modes[i];
+        }
+    }
+    return NULL;
+}
+#endif
+
+static void x11_change_wm_fullscreen(podi_window_x11 *window, bool enable) {
+    if (!window || !window->app) return;
+
+    podi_application_x11 *app = window->app;
+    if (app->net_wm_state == None || app->net_wm_state_fullscreen == None) {
+        return;
+    }
+
+    XEvent event = {0};
+    event.xclient.type = ClientMessage;
+    event.xclient.serial = 0;
+    event.xclient.send_event = True;
+    event.xclient.display = app->display;
+    event.xclient.window = window->window;
+    event.xclient.message_type = app->net_wm_state;
+    event.xclient.format = 32;
+    event.xclient.data.l[0] = enable ? NET_WM_STATE_ADD : NET_WM_STATE_REMOVE;
+    event.xclient.data.l[1] = app->net_wm_state_fullscreen;
+    event.xclient.data.l[2] = 0;
+    event.xclient.data.l[3] = 1;
+    event.xclient.data.l[4] = 0;
+
+    XSendEvent(app->display, RootWindow(app->display, app->screen), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &event);
+
+    if (app->net_wm_bypass_compositor != None) {
+        unsigned long bypass = enable ? 1UL : 0UL;
+        XChangeProperty(app->display, window->window, app->net_wm_bypass_compositor,
+                        XA_CARDINAL, 32, PropModeReplace,
+                       (unsigned char *)&bypass, 1);
+    }
+}
+
+#if PODI_HAS_XRANDR
+static bool x11_load_randr_symbols(void) {
+    if (g_xrandr.library) {
+        return true;
+    }
+
+    const char *candidates[] = {
+        "libXrandr.so.2",
+        "libXrandr.so"
+    };
+
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        void *handle = dlopen(candidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (handle) {
+            g_xrandr.library = handle;
+            break;
+        }
+    }
+
+    if (!g_xrandr.library) {
+        return false;
+    }
+
+    g_xrandr.query_extension = (Bool (*)(Display *, int *, int *))dlsym(g_xrandr.library, "XRRQueryExtension");
+    g_xrandr.query_version = (Status (*)(Display *, int *, int *))dlsym(g_xrandr.library, "XRRQueryVersion");
+    g_xrandr.get_screen_resources_current = (XRRScreenResources *(*)(Display *, Window))dlsym(g_xrandr.library, "XRRGetScreenResourcesCurrent");
+    g_xrandr.get_output_info = (XRROutputInfo *(*)(Display *, XRRScreenResources *, RROutput))dlsym(g_xrandr.library, "XRRGetOutputInfo");
+    g_xrandr.get_crtc_info = (XRRCrtcInfo *(*)(Display *, XRRScreenResources *, RRCrtc))dlsym(g_xrandr.library, "XRRGetCrtcInfo");
+    g_xrandr.free_screen_resources = (void (*)(XRRScreenResources *))dlsym(g_xrandr.library, "XRRFreeScreenResources");
+    g_xrandr.free_output_info = (void (*)(XRROutputInfo *))dlsym(g_xrandr.library, "XRRFreeOutputInfo");
+    g_xrandr.free_crtc_info = (void (*)(XRRCrtcInfo *))dlsym(g_xrandr.library, "XRRFreeCrtcInfo");
+    g_xrandr.set_crtc_config = (Status (*)(Display *, XRRScreenResources *, RRCrtc, Time,
+                                           int, int, RRMode, Rotation, RROutput *, int))
+        dlsym(g_xrandr.library, "XRRSetCrtcConfig");
+    g_xrandr.get_output_primary = (RROutput (*)(Display *, Window))dlsym(g_xrandr.library, "XRRGetOutputPrimary");
+
+    if (!g_xrandr.query_extension || !g_xrandr.query_version ||
+        !g_xrandr.get_screen_resources_current || !g_xrandr.get_output_info ||
+        !g_xrandr.get_crtc_info || !g_xrandr.free_screen_resources ||
+        !g_xrandr.free_output_info || !g_xrandr.free_crtc_info ||
+        !g_xrandr.set_crtc_config || !g_xrandr.get_output_primary) {
+        dlclose(g_xrandr.library);
+        memset(&g_xrandr, 0, sizeof(g_xrandr));
+        return false;
+    }
+
+    return true;
+}
+#else
+#define x11_load_randr_symbols() false
+#endif
+
 static uint32_t x11_state_to_podi_modifiers(unsigned int state) {
     uint32_t modifiers = 0;
     if (state & ShiftMask) modifiers |= PODI_MOD_SHIFT;
@@ -231,6 +386,22 @@ static podi_application *x11_application_create(void) {
     app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
     app->net_wm_moveresize = XInternAtom(app->display, "_NET_WM_MOVERESIZE", False);
     app->net_active_window = XInternAtom(app->display, "_NET_ACTIVE_WINDOW", False);
+    app->net_wm_state = XInternAtom(app->display, "_NET_WM_STATE", False);
+    app->net_wm_state_fullscreen = XInternAtom(app->display, "_NET_WM_STATE_FULLSCREEN", False);
+    app->net_wm_bypass_compositor = XInternAtom(app->display, "_NET_WM_BYPASS_COMPOSITOR", False);
+
+    app->randr_available = false;
+#if PODI_HAS_XRANDR
+    if (x11_load_randr_symbols()) {
+        if (g_xrandr.query_extension(app->display, &app->randr_event_base, &app->randr_error_base)) {
+            int randr_major = 1;
+            int randr_minor = 5;
+            if (g_xrandr.query_version(app->display, &randr_major, &randr_minor) == Success) {
+                app->randr_available = true;
+            }
+        }
+    }
+#endif
 
     // Set locale to user's preference for proper text handling
     setlocale(LC_ALL, "");
@@ -772,9 +943,17 @@ static podi_window *x11_window_create(podi_application *app_generic, const char 
     window->common.cursor_locked = false;
     window->common.cursor_visible = true;
     window->common.last_cursor_x = 0.0;
-    window->common.last_cursor_y = 0.0;
-    window->common.cursor_warping = false;
-    window->invisible_cursor = None;
+   window->common.last_cursor_y = 0.0;
+   window->common.cursor_warping = false;
+   window->invisible_cursor = None;
+
+    window->common.fullscreen_exclusive = false;
+    window->common.restore_geometry_valid = false;
+    window->common.restore_x = 0;
+    window->common.restore_y = 0;
+    window->common.restore_width = width;
+    window->common.restore_height = height;
+    window->restore_crtc_valid = false;
 
     // Create window at the requested size (physical pixels)
     // Applications can use podi_get_display_scale_factor() to scale to logical size if desired
@@ -853,6 +1032,10 @@ static podi_window *x11_window_create(podi_application *app_generic, const char 
 static void x11_window_destroy(podi_window *window_generic) {
     podi_window_x11 *window = (podi_window_x11 *)window_generic;
     if (!window) return;
+
+    if (window->common.fullscreen_exclusive) {
+        x11_window_set_fullscreen_exclusive(window_generic, false);
+    }
 
     podi_application_x11 *app = window->app;
 
@@ -1224,6 +1407,155 @@ static void x11_window_get_cursor_position(podi_window *window_generic, double *
     }
 }
 
+static void x11_window_set_fullscreen_exclusive(podi_window *window_generic, bool enabled) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window || !window->app) return;
+
+    podi_application_x11 *app = window->app;
+    Display *display = app->display;
+#if PODI_HAS_XRANDR
+    Window root = RootWindow(display, app->screen);
+#endif
+
+    if (enabled) {
+        if (window->common.fullscreen_exclusive) {
+            return;
+        }
+
+        XWindowAttributes attrs;
+        if (XGetWindowAttributes(display, window->window, &attrs)) {
+            window->common.restore_geometry_valid = true;
+            window->common.restore_x = attrs.x;
+            window->common.restore_y = attrs.y;
+            window->common.restore_width = attrs.width;
+            window->common.restore_height = attrs.height;
+        } else {
+            window->common.restore_geometry_valid = false;
+        }
+
+#if PODI_HAS_XRANDR
+        if (app->randr_available) {
+            XRRScreenResources *resources = g_xrandr.get_screen_resources_current(display, root);
+            if (resources) {
+                RROutput output = g_xrandr.get_output_primary(display, root);
+                if (!output && resources->noutput > 0) {
+                    output = resources->outputs[0];
+                }
+
+                window->restore_crtc_valid = false;
+
+                if (output) {
+                    XRROutputInfo *output_info = g_xrandr.get_output_info(display, resources, output);
+                    if (output_info && output_info->connection == RR_Connected && output_info->crtc) {
+                        XRRCrtcInfo *crtc_info = g_xrandr.get_crtc_info(display, resources, output_info->crtc);
+                        if (crtc_info) {
+                            window->restore_crtc_valid = true;
+                            window->fullscreen_output = output;
+                            window->fullscreen_crtc = output_info->crtc;
+                            window->restore_mode = crtc_info->mode;
+                            window->restore_rotation = crtc_info->rotation;
+                            window->restore_crtc_x = crtc_info->x;
+                            window->restore_crtc_y = crtc_info->y;
+                            window->restore_crtc_width = crtc_info->width;
+                            window->restore_crtc_height = crtc_info->height;
+
+                            int screen_width = DisplayWidth(display, app->screen);
+                            int screen_height = DisplayHeight(display, app->screen);
+
+                            RRMode desired_mode = crtc_info->mode;
+                            for (int i = 0; i < output_info->nmode; ++i) {
+                                const XRRModeInfo *mode_info = x11_find_mode_info(resources, output_info->modes[i]);
+                                if (!mode_info) continue;
+                                if ((int)mode_info->width == screen_width &&
+                                    (int)mode_info->height == screen_height) {
+                                    desired_mode = mode_info->id;
+                                    break;
+                                }
+                            }
+
+                            if (desired_mode != crtc_info->mode) {
+                                RROutput outputs[] = { output };
+                                g_xrandr.set_crtc_config(display, resources, output_info->crtc, CurrentTime,
+                                                         crtc_info->x, crtc_info->y, desired_mode,
+                                                         crtc_info->rotation, outputs, 1);
+                            }
+
+                            g_xrandr.free_crtc_info(crtc_info);
+                        }
+                    }
+
+                    if (output_info) {
+                        g_xrandr.free_output_info(output_info);
+                    }
+                }
+
+                g_xrandr.free_screen_resources(resources);
+            }
+        } else {
+            window->restore_crtc_valid = false;
+        }
+#else
+        window->restore_crtc_valid = false;
+#endif
+
+        int target_width = DisplayWidth(display, app->screen);
+        int target_height = DisplayHeight(display, app->screen);
+
+        x11_change_wm_fullscreen(window, true);
+
+        XMoveResizeWindow(display, window->window, 0, 0,
+                          (unsigned int)target_width, (unsigned int)target_height);
+        XRaiseWindow(display, window->window);
+
+        window->common.cursor_center_x = target_width / 2.0;
+        window->common.cursor_center_y = target_height / 2.0;
+        window->common.fullscreen_exclusive = true;
+    } else {
+        if (!window->common.fullscreen_exclusive) {
+            return;
+        }
+
+        x11_change_wm_fullscreen(window, false);
+
+#if PODI_HAS_XRANDR
+        if (app->randr_available && window->restore_crtc_valid) {
+            XRRScreenResources *resources = g_xrandr.get_screen_resources_current(display, root);
+            if (resources) {
+                RROutput outputs[] = { window->fullscreen_output };
+                g_xrandr.set_crtc_config(display, resources, window->fullscreen_crtc, CurrentTime,
+                                         window->restore_crtc_x, window->restore_crtc_y,
+                                         window->restore_mode, window->restore_rotation,
+                                         outputs, 1);
+                g_xrandr.free_screen_resources(resources);
+            }
+            window->restore_crtc_valid = false;
+        }
+#else
+        window->restore_crtc_valid = false;
+#endif
+
+        if (window->common.restore_geometry_valid) {
+            XMoveResizeWindow(display, window->window,
+                              window->common.restore_x,
+                              window->common.restore_y,
+                              (unsigned int)window->common.restore_width,
+                              (unsigned int)window->common.restore_height);
+        }
+
+        window->common.fullscreen_exclusive = false;
+    }
+
+    XFlush(display);
+}
+
+static bool x11_window_is_fullscreen_exclusive(podi_window *window_generic) {
+    podi_window_x11 *window = (podi_window_x11 *)window_generic;
+    if (!window) {
+        return false;
+    }
+    return window->common.fullscreen_exclusive;
+}
+
 static void x11_window_begin_interactive_resize(podi_window *window_generic, int edge) {
     (void)window_generic;
     (void)edge;
@@ -1258,6 +1590,8 @@ const podi_platform_vtable x11_vtable = {
     .window_set_cursor = x11_window_set_cursor,
     .window_set_cursor_mode = x11_window_set_cursor_mode,
     .window_get_cursor_position = x11_window_get_cursor_position,
+    .window_set_fullscreen_exclusive = x11_window_set_fullscreen_exclusive,
+    .window_is_fullscreen_exclusive = x11_window_is_fullscreen_exclusive,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = x11_window_get_x11_handles,
     .window_get_wayland_handles = x11_window_get_wayland_handles,

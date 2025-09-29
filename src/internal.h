@@ -30,6 +30,8 @@ typedef struct podi_platform_vtable {
     void (*window_set_cursor)(podi_window *window, podi_cursor_shape cursor);
     void (*window_set_cursor_mode)(podi_window *window, bool locked, bool visible);
     void (*window_get_cursor_position)(podi_window *window, double *x, double *y);
+    void (*window_set_fullscreen_exclusive)(podi_window *window, bool enabled);
+    bool (*window_is_fullscreen_exclusive)(podi_window *window);
 
 #ifdef PODI_PLATFORM_LINUX
     bool (*window_get_x11_handles)(podi_window *window, podi_x11_handles *handles);
@@ -71,6 +73,12 @@ typedef struct {
     double cursor_center_x, cursor_center_y;  // Window center coordinates for locking
     double last_cursor_x, last_cursor_y;      // Last cursor position for delta calculation
     bool cursor_warping;                       // Flag to track when we're warping cursor (X11 only)
+
+    // Fullscreen tracking
+    bool fullscreen_exclusive;
+    bool restore_geometry_valid;
+    int restore_x, restore_y;
+    int restore_width, restore_height;
 } podi_window_common;
 
 void podi_init_platform(void);

@@ -124,6 +124,18 @@ void podi_window_get_cursor_position(podi_window *window, double *x, double *y) 
     podi_platform->window_get_cursor_position(window, x, y);
 }
 
+void podi_window_set_fullscreen_exclusive(podi_window *window, bool enabled) {
+    if (!window) return;
+    if (!podi_platform->window_set_fullscreen_exclusive) return;
+    podi_platform->window_set_fullscreen_exclusive(window, enabled);
+}
+
+bool podi_window_is_fullscreen_exclusive(podi_window *window) {
+    if (!window) return false;
+    if (!podi_platform->window_is_fullscreen_exclusive) return false;
+    return podi_platform->window_is_fullscreen_exclusive(window);
+}
+
 #ifdef PODI_PLATFORM_LINUX
 bool podi_window_get_x11_handles(podi_window *window, podi_x11_handles *handles) {
     if (!window || !handles) return false;

@@ -145,6 +145,8 @@ void podi_window_begin_move(podi_window *window);
 void podi_window_set_cursor(podi_window *window, podi_cursor_shape cursor);
 void podi_window_set_cursor_mode(podi_window *window, bool locked, bool visible);
 void podi_window_get_cursor_position(podi_window *window, double *x, double *y);
+void podi_window_set_fullscreen_exclusive(podi_window *window, bool enabled);
+bool podi_window_is_fullscreen_exclusive(podi_window *window);
 
 #ifdef PODI_PLATFORM_LINUX
 typedef struct podi_x11_handles {
