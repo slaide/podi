@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 // Client-side decoration constants (logical pixels)
-#define PODI_TITLE_BAR_HEIGHT 40
+#define PODI_TITLE_BAR_HEIGHT 30
 
 typedef struct podi_platform_vtable {
     podi_application *(*application_create)(void);
