@@ -136,6 +136,12 @@ bool podi_window_is_fullscreen_exclusive(podi_window *window) {
     return podi_platform->window_is_fullscreen_exclusive(window);
 }
 
+int podi_window_get_title_bar_height(podi_window *window) {
+    if (!window) return 0;
+    if (!podi_platform->window_get_title_bar_height) return 0;
+    return podi_platform->window_get_title_bar_height(window);
+}
+
 #ifdef PODI_PLATFORM_LINUX
 bool podi_window_get_x11_handles(podi_window *window, podi_x11_handles *handles) {
     if (!window || !handles) return false;

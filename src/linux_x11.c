@@ -1556,6 +1556,13 @@ static bool x11_window_is_fullscreen_exclusive(podi_window *window_generic) {
     return window->common.fullscreen_exclusive;
 }
 
+static int x11_window_get_title_bar_height(podi_window *window_generic) {
+    (void)window_generic;
+    // X11 uses server-side decorations provided by the window manager
+    // Therefore, there is no client-side title bar and height is always 0
+    return 0;
+}
+
 static void x11_window_begin_interactive_resize(podi_window *window_generic, int edge) {
     (void)window_generic;
     (void)edge;
@@ -1592,6 +1599,7 @@ const podi_platform_vtable x11_vtable = {
     .window_get_cursor_position = x11_window_get_cursor_position,
     .window_set_fullscreen_exclusive = x11_window_set_fullscreen_exclusive,
     .window_is_fullscreen_exclusive = x11_window_is_fullscreen_exclusive,
+    .window_get_title_bar_height = x11_window_get_title_bar_height,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = x11_window_get_x11_handles,
     .window_get_wayland_handles = x11_window_get_wayland_handles,

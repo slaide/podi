@@ -1660,6 +1660,19 @@ static void wayland_window_begin_move(podi_window *window_generic) {
                      window->app->last_input_serial);
 }
 
+static int wayland_window_get_title_bar_height(podi_window *window_generic) {
+    podi_window_wayland *window = (podi_window_wayland *)window_generic;
+    if (!window) return 0;
+
+    // If server-side decorations are being used, there is no client-side title bar
+    if (window->has_server_decorations) {
+        return 0;
+    }
+
+    // For client-side decorations, return the title bar height scaled by the display factor
+    return (int)(PODI_TITLE_BAR_HEIGHT * window->common.scale_factor);
+}
+
 const podi_platform_vtable wayland_vtable = {
     .application_create = wayland_application_create,
     .application_destroy = wayland_application_destroy,
@@ -1685,6 +1698,7 @@ const podi_platform_vtable wayland_vtable = {
     .window_get_cursor_position = wayland_window_get_cursor_position,
     .window_set_fullscreen_exclusive = wayland_window_set_fullscreen_exclusive,
     .window_is_fullscreen_exclusive = wayland_window_is_fullscreen_exclusive,
+    .window_get_title_bar_height = wayland_window_get_title_bar_height,
 #ifdef PODI_PLATFORM_LINUX
     .window_get_x11_handles = wayland_window_get_x11_handles,
     .window_get_wayland_handles = wayland_window_get_wayland_handles,
